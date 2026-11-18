@@ -23,6 +23,10 @@ Requires WordPress 6.9 or later and PHP 7.4 or later.
 
 Site Agent MCP Full adds server-level tools (files, SQL, PHP, WP-CLI, offered per connection and off by default), backup restore from the admin screen, site import, and updates from mcp.wordpress-custom.com. It is available from https://mcp.wordpress-custom.com/.
 
+## Support
+
+The plugin is free and stays free. To support its development and get advanced courses, tips and early versions, join the Yes Web Build community on Patreon: https://www.patreon.com/c/yeswebuild
+
 ## Issues and security
 
 Report bugs and suggestions in [Issues](../../issues). Do not post security problems publicly: use GitHub's private vulnerability reporting (Security > Report a vulnerability).
