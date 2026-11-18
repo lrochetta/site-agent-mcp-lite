@@ -3,7 +3,7 @@
  * Plugin Name:       Site Agent MCP Lite
  * Plugin URI:        https://mcp.wordpress-custom.com/
  * Description:       Remote MCP server with OAuth 2.1. Lets AI agents work on this site within the access you choose for each role and account.
- * Version:           0.8.1
+ * Version:           0.9.0
  * Requires at least: 6.9
  * Requires PHP:      7.4
  * Author:            Laurent Rochetta
@@ -32,7 +32,7 @@ if ( defined( 'SAMCP_VERSION' ) ) {
 	return;
 }
 
-define( 'SAMCP_VERSION', '0.8.1' );
+define( 'SAMCP_VERSION', '0.9.0' );
 define( 'SAMCP_FILE', __FILE__ );
 define( 'SAMCP_DIR', plugin_dir_path( __FILE__ ) );
 // SAMCP_EDITION: 'full' here, 'lite' in the wordpress.org build. See includes/edition.php.
@@ -50,9 +50,11 @@ require_once SAMCP_DIR . 'includes/class-journal.php';
 require_once SAMCP_DIR . 'includes/class-tools.php';
 require_once SAMCP_DIR . 'includes/class-seo-tools.php';
 require_once SAMCP_DIR . 'includes/class-search-console.php';
+require_once SAMCP_DIR . 'includes/class-site-kit.php';
 require_once SAMCP_DIR . 'includes/class-security-audit.php';
 require_once SAMCP_DIR . 'includes/class-backup.php';
 require_once SAMCP_DIR . 'includes/class-admin-page.php';
+require_once SAMCP_DIR . 'includes/class-release-notice.php';
 
 register_activation_hook(
 	__FILE__,
@@ -74,3 +76,7 @@ SiteAgentMCP\Seo_Tools::boot();
 SiteAgentMCP\Search_Console::boot();
 SiteAgentMCP\Backup::boot();
 SiteAgentMCP\Admin_Page::boot();
+// The Full edition has its own updater; Lite only offers an opt-in notice of new versions.
+if ( 'lite' === SAMCP_EDITION ) {
+	SiteAgentMCP\Release_Notice::boot();
+}

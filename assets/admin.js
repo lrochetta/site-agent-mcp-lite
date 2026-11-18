@@ -1,6 +1,7 @@
 /**
- * Site Agent MCP admin screens: copy buttons, AI app tabs, confirmation
- * dialogs, focus on the notice of the last action, and backup progress.
+ * Site Agent MCP admin screens: copy buttons, AI app tabs, the new-connection
+ * window, confirmation dialogs, focus on the notice of the last action, and
+ * backup progress.
  * No dependency.
  */
 ( function () {
@@ -179,6 +180,86 @@
 		} );
 		select( initial, false );
 	} );
+
+	/* ------------------------------------------------------------ pairing window */
+
+	/*
+	 * New connections close at a set time, or once an app is approved in another
+	 * tab. The panel shows "Closed" when the time passes and, on return to this
+	 * tab, after asking the server again. The change is announced once.
+	 */
+	var pairing = root.querySelector( '[data-samcp-pairing-until]' );
+	if ( pairing ) {
+		var pairingStrings = strings.pairing || {};
+		// Server time minus browser time, so a wrong computer clock does not matter.
+		var skew = ( +pairing.getAttribute( 'data-samcp-pairing-now' ) * 1000 ) - Date.now();
+		var closesAt = +pairing.getAttribute( 'data-samcp-pairing-until' ) * 1000;
+		var pairingClosed = false;
+		var pairingTimer = null;
+		var hiddenSince = 0;
+
+		var markClosed = function () {
+			if ( pairingClosed ) {
+				return;
+			}
+			pairingClosed = true;
+			window.clearTimeout( pairingTimer );
+			var badgeBox = pairing.querySelector( '.samcp-badge' );
+			if ( badgeBox ) {
+				badgeBox.className = 'samcp-badge is-neutral';
+				badgeBox.textContent = pairingStrings.closed || 'Closed';
+			}
+			var textBox = pairing.querySelector( '[data-samcp-pairing-text]' );
+			if ( textBox && pairingStrings.text ) {
+				textBox.textContent = pairingStrings.text;
+			}
+			// The same form opens new connections again: same action, same nonce.
+			var field = pairing.querySelector( '[data-samcp-pairing-field]' );
+			var button = pairing.querySelector( '[data-samcp-pairing-button]' );
+			if ( field && button ) {
+				field.value = 'open';
+				button.textContent = pairingStrings.button || 'Allow a new connection';
+				button.classList.add( 'button-primary' );
+			}
+			announce( pairingStrings.ended || 'New connections are now closed.' );
+		};
+
+		var checkTime = function () {
+			var left = closesAt - ( Date.now() + skew );
+			if ( left <= 0 ) {
+				markClosed();
+				return;
+			}
+			window.clearTimeout( pairingTimer );
+			// Timers sleep in background tabs: the visibility check below catches up.
+			pairingTimer = window.setTimeout( checkTime, Math.min( left + 500, 60000 ) );
+		};
+
+		document.addEventListener( 'visibilitychange', function () {
+			if ( document.hidden ) {
+				hiddenSince = Date.now();
+				return;
+			}
+			if ( pairingClosed ) {
+				return;
+			}
+			checkTime();
+			// Back after a while: an app may have been approved meanwhile, which closes the window.
+			if ( ! pairingClosed && hiddenSince && Date.now() - hiddenSince > 3000 && window.fetch ) {
+				window.fetch( window.location.href, { credentials: 'same-origin' } )
+					.then( function ( response ) {
+						return response.ok ? response.text() : '';
+					} )
+					.then( function ( html ) {
+						if ( html && -1 === html.indexOf( 'data-samcp-pairing-until=' ) ) {
+							markClosed();
+						}
+					} )
+					.catch( function () {} );
+			}
+		} );
+		checkTime();
+	}
 
 	/* ------------------------------------------------------------ confirmation */
 

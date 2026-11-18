@@ -763,8 +763,44 @@ class Policy {
 		if ( $value === $old_value || maybe_serialize( $value ) === maybe_serialize( $old_value ) ) {
 			return $value;
 		}
+		// A protected setting on a screen an agent saves unchanged: an unticked box comes as null
+		// over a stored "0", new_admin_email as the current address. Both keep their stored value
+		// instead of being refused, since nothing changes.
+		$context = self::$internal ? null : self::current();
+		if ( $context && self::is_protected_option( (string) $option, $context ) && ( self::both_off( $value, $old_value ) || self::is_current_admin_email( $option, $value ) ) ) {
+			return $old_value;
+		}
 		self::check_option( $option );
 		return $value;
+	}
+
+	/**
+	 * Whether two option values are both an empty or "off" scalar (null, false, "", "0", 0).
+	 *
+	 * @param mixed $value     New value.
+	 * @param mixed $old_value Stored value.
+	 * @return bool
+	 */
+	private static function both_off( $value, $old_value ) {
+		foreach ( array( $value, $old_value ) as $one ) {
+			if ( ! ( null === $one || is_scalar( $one ) ) || ! empty( $one ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Whether a write is General Settings posting the current address as new_admin_email.
+	 * Core keeps that field only as a pending change request and ignores it when it equals
+	 * admin_email.
+	 *
+	 * @param string $option Option name.
+	 * @param mixed  $value  Value.
+	 * @return bool
+	 */
+	private static function is_current_admin_email( $option, $value ) {
+		return 'new_admin_email' === self::normalise_option( (string) $option ) && is_string( $value ) && get_option( 'admin_email' ) === $value;
 	}
 
 	/**

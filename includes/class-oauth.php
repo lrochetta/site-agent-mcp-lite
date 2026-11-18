@@ -18,6 +18,9 @@ class OAuth {
 	const SCOPE_FULL  = 'wp:full';
 	const SCOPE_POWER = 'wp:power';
 
+	/** User meta key prefix of a consent request waiting for its answer, followed by the request id. */
+	const PENDING_META = 'samcp_az_';
+
 	/** Known client callbacks. See docs/research/2026-11-03-foundations.md. */
 	const REDIRECT_PATTERNS = array(
 		'#^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/[^?\#]*)?$#',
@@ -80,11 +83,14 @@ class OAuth {
 		}
 		$path = '/' . ltrim( $path, '/' );
 
-		if ( 0 === strpos( $path, '/.well-known/oauth-protected-resource' ) ) {
+		// Exact paths only: another identity provider on this host keeps its own discovery documents.
+		$discovery = untrailingslashit( $path );
+		$is_known  = 0 === strpos( $discovery, '/.well-known/' );
+		if ( $is_known && in_array( $discovery, self::discovery_paths( 'resource' ), true ) ) {
 			self::cors();
 			self::json( self::protected_resource_metadata() );
 		}
-		if ( 0 === strpos( $path, '/.well-known/oauth-authorization-server' ) || 0 === strpos( $path, '/.well-known/openid-configuration' ) ) {
+		if ( $is_known && in_array( $discovery, self::discovery_paths( 'server' ), true ) ) {
 			self::cors();
 			self::json( self::server_metadata() );
 		}
@@ -112,6 +118,34 @@ class OAuth {
 			self::oauth_error( 'invalid_request', 'HTTPS is required.', 400 );
 		}
 		self::$handler();
+	}
+
+	/**
+	 * Discovery paths this server answers, relative to the site's home path: the root
+	 * documents and their RFC 9728 / RFC 8414 forms with the resource or issuer path appended.
+	 *
+	 * @param string $kind resource or server.
+	 * @return string[]
+	 */
+	private static function discovery_paths( $kind ) {
+		if ( 'resource' === $kind ) {
+			$suffix = untrailingslashit( (string) wp_parse_url( self::resource(), PHP_URL_PATH ) );
+			$names  = array( '/.well-known/oauth-protected-resource' );
+		} else {
+			$suffix = untrailingslashit( (string) wp_parse_url( self::issuer(), PHP_URL_PATH ) );
+			// openid-configuration is an alias for clients that only look there. This server is not an
+			// OpenID provider and issues no ID token; offline_access is advertised because some clients
+			// ask for it to receive a refresh token, which every connection gets anyway.
+			$names = array( '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration' );
+		}
+		$paths = array();
+		foreach ( $names as $name ) {
+			$paths[] = $name;
+			if ( '' !== $suffix ) {
+				$paths[] = $name . $suffix;
+			}
+		}
+		return $paths;
 	}
 
 	/**
@@ -172,7 +206,7 @@ class OAuth {
 	 */
 	public static function scopes_supported() {
 		$scopes = array( Policy::SCOPE_READ, Policy::SCOPE_CONTENT, self::SCOPE_FULL );
-		return 'full' === SAMCP_EDITION ? array_merge( $scopes, array( self::SCOPE_POWER ) ) : $scopes;
+		return $scopes;
 	}
 
 	/**
@@ -234,7 +268,7 @@ class OAuth {
 	 * @param string $uri URI.
 	 * @return bool
 	 */
-	private static function is_loopback( $uri ) {
+	public static function is_loopback( $uri ) {
 		return (bool) preg_match( '#^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(/|$)#', $uri );
 	}
 
@@ -364,6 +398,9 @@ class OAuth {
 		}
 		$name   = isset( $input['client_name'] ) && is_string( $input['client_name'] ) ? sanitize_text_field( $input['client_name'] ) : 'Unnamed client';
 		$client = Store::create_client( $name, $uris, 'dcr' );
+		if ( ! Store::get_client( $client['client_id'] ) ) {
+			self::oauth_error( 'temporarily_unavailable', 'The site could not store the registration. Try again in a moment.', 503 );
+		}
 		self::json(
 			array(
 				'client_id'                  => $client['client_id'],
@@ -407,6 +444,17 @@ class OAuth {
 			exit;
 		}
 
+		// The account and its window come before the client: a person who cannot connect
+		// never makes this site fetch a metadata document.
+		$user_id = get_current_user_id();
+		if ( ! self::user_can_connect( $user_id ) ) {
+			self::error_page( __( 'Your account is not allowed to connect AI agents to this site.', 'site-agent-mcp-lite' ) );
+		}
+		// A link alone never connects an app: this person opens new connections in wp-admin first.
+		if ( ! Policy::pairing_open( $user_id ) ) {
+			self::closed_page();
+		}
+
 		// Never redirect until the client and its callback are proven.
 		$client = self::resolve_client( $params['client_id'] );
 		if ( ! $client ) {
@@ -435,26 +483,60 @@ class OAuth {
 			self::redirect_error( $params, 'invalid_target', 'This server only issues tokens for its MCP endpoint.' );
 		}
 
-		$user_id = get_current_user_id();
-		if ( ! self::user_can_connect( $user_id ) ) {
-			self::error_page( __( 'Your account is not allowed to connect AI agents to this site.', 'site-agent-mcp-lite' ) );
-		}
-		// A link alone never connects an app: this person opens new connections in wp-admin first.
-		if ( ! Policy::pairing_open( $user_id ) ) {
-			self::closed_page();
-		}
-
 		$request_id = Store::random( 16 );
-		set_transient(
-			'samcp_az_' . $request_id,
+		self::pending_put(
+			$user_id,
+			$request_id,
 			array(
 				'user_id' => $user_id,
 				'params'  => $params,
 				'client'  => $client,
-			),
-			10 * MINUTE_IN_SECONDS
+			)
 		);
 		self::consent_page( $request_id, $client, $params );
+	}
+
+	/**
+	 * Keep a consent request until the person answers it. It waits in the person's user
+	 * meta, not in a transient: with an object cache that does not persist between
+	 * requests, a transient vanishes before the answer and every consent would expire.
+	 *
+	 * @param int    $user_id    Person shown the consent screen.
+	 * @param string $request_id Request id printed in the form.
+	 * @param array  $pending    Request.
+	 */
+	private static function pending_put( $user_id, $request_id, array $pending ) {
+		// Requests never answered are dropped when the same person opens a new one.
+		foreach ( array_keys( (array) get_user_meta( $user_id ) ) as $key ) {
+			if ( 0 === strpos( (string) $key, self::PENDING_META ) ) {
+				$old = get_user_meta( $user_id, $key, true );
+				if ( ! is_array( $old ) || ! isset( $old['expires'] ) || (int) $old['expires'] < time() ) {
+					delete_user_meta( $user_id, $key );
+				}
+			}
+		}
+		$pending['expires'] = time() + 10 * MINUTE_IN_SECONDS;
+		update_user_meta( $user_id, self::PENDING_META . $request_id, $pending );
+	}
+
+	/**
+	 * Take a consent request: it can be answered once, by the person it was shown to, within ten minutes.
+	 *
+	 * @param int    $user_id    Person answering.
+	 * @param string $request_id Request id from the form.
+	 * @return array|false
+	 */
+	private static function pending_take( $user_id, $request_id ) {
+		if ( ! $user_id || '' === $request_id ) {
+			return false;
+		}
+		$key     = self::PENDING_META . $request_id;
+		$pending = get_user_meta( $user_id, $key, true );
+		// Deleted before it is used: the same answer cannot be sent twice.
+		if ( ! delete_user_meta( $user_id, $key ) || ! is_array( $pending ) || ! isset( $pending['expires'] ) || (int) $pending['expires'] < time() ) {
+			return false;
+		}
+		return $pending;
 	}
 
 	/**
@@ -555,14 +637,15 @@ class OAuth {
 		if ( ! self::has_browser_session() || ! isset( $_POST['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( wp_unslash( $_POST['_wpnonce'] ) ), 'samcp_consent_' . $request_id ) ) {
 			self::error_page( __( 'This page has expired. Start the connection again from your AI application.', 'site-agent-mcp-lite' ) );
 		}
-		$pending = get_transient( 'samcp_az_' . $request_id );
+		$pending = self::pending_take( get_current_user_id(), $request_id );
 		if ( ! is_array( $pending ) || (int) $pending['user_id'] !== get_current_user_id() ) {
 			self::error_page( __( 'This page has expired. Start the connection again from your AI application.', 'site-agent-mcp-lite' ) );
 		}
-		delete_transient( 'samcp_az_' . $request_id );
 
 		$params = $pending['params'];
-		if ( ! isset( $_POST['approve'] ) ) {
+		// The one-click "read only" button approves with the smallest access, whatever else is ticked.
+		$read_only = isset( $_POST['approve_read'] );
+		if ( ! isset( $_POST['approve'] ) && ! $read_only ) {
 			self::redirect_error( $params, 'access_denied', 'The user refused the connection.' );
 		}
 		if ( ! Policy::enabled() || ! Policy::pairing_open( (int) $pending['user_id'] ) || ! self::user_can_connect( (int) $pending['user_id'] ) ) {
@@ -571,13 +654,12 @@ class OAuth {
 
 		// The person picks the level; it can never exceed what the settings allow their account.
 		$max    = Policy::user_max_level( (int) $pending['user_id'] );
-		$asked  = isset( $_POST['access_level'] ) ? sanitize_key( wp_unslash( $_POST['access_level'] ) ) : 'read';
+		$asked  = ! $read_only && isset( $_POST['access_level'] ) ? sanitize_key( wp_unslash( $_POST['access_level'] ) ) : 'read';
 		$level  = Policy::is_level( $asked ) && 'none' !== $asked ? Policy::lower( $asked, $max ) : 'read';
 		$scopes = array( Policy::level_scope( $level ) );
 		if ( 'full' === $level && isset( $_POST['grant_power'] ) && self::power_tools_enabled() && user_can( $pending['user_id'], 'manage_options' ) ) {
 			$scopes[] = self::SCOPE_POWER;
 		}
-		self::notify( (int) $pending['user_id'], $pending['client']['name'], $params['redirect_uri'], $level, in_array( self::SCOPE_POWER, $scopes, true ) );
 
 		$code = Store::issue(
 			'code',
@@ -594,6 +676,11 @@ class OAuth {
 			),
 			Store::CODE_TTL
 		);
+		if ( '' === $code ) {
+			// Nothing was stored: keep the window open so the person can simply try again.
+			self::redirect_error( $params, 'temporarily_unavailable', 'The site could not store the authorization. Try again in a moment.' );
+		}
+		self::notify( (int) $pending['user_id'], $pending['client']['name'], $params['redirect_uri'], $level, in_array( self::SCOPE_POWER, $scopes, true ) );
 		// One approval per opening: the next app needs a new click in wp-admin.
 		Policy::close_pairing( (int) $pending['user_id'] );
 		self::redirect_to_client( $params, array( 'code' => $code ) );
@@ -644,6 +731,21 @@ class OAuth {
 	}
 
 	/**
+	 * Level an app asked for in its scope parameter, or an empty string when it named none.
+	 * When several levels are named, the smallest wins.
+	 *
+	 * @param string $scope Space-separated scopes from the authorization request.
+	 * @return string read, content, full or ''.
+	 */
+	private static function requested_level( $scope ) {
+		$level = Policy::scope_level( $scope );
+		if ( 'none' === $level && in_array( self::SCOPE_POWER, explode( ' ', (string) $scope ), true ) ) {
+			$level = 'full';
+		}
+		return 'none' === $level ? '' : $level;
+	}
+
+	/**
 	 * Render the consent screen and stop.
 	 *
 	 * @param string $request_id Pending request.
@@ -661,8 +763,11 @@ class OAuth {
 				$levels[] = $candidate;
 			}
 		}
-		// The Lite edition proposes the smallest access; the person can choose more.
-		$preselect  = 'full' === SAMCP_EDITION ? $max : 'read';
+		// The Lite edition proposes the smallest access; the person can choose more. The Full edition
+		// proposes what the account can do, unless the app itself asked for less.
+		$requested  = self::requested_level( $params['scope'] );
+		$preselect  = 'full' === SAMCP_EDITION ? ( '' !== $requested ? Policy::lower( $requested, $max ) : $max ) : 'read';
+		$offer_read = 'read' !== $preselect && in_array( 'read', $levels, true );
 		$can_power  = 'full' === $max && self::power_tools_enabled() && user_can( $user, 'manage_options' );
 		$can_code   = 'full' === $max && Policy::extensions_allowed() && user_can( $user, 'install_plugins' );
 		// The return address is where the access goes: show its scheme, host and port.
@@ -714,6 +819,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;margin:16px 0}dt{col
 .levels{border:0;padding:0;margin:24px 0 8px}.levels legend{font-weight:600;font-size:16px;margin-bottom:8px;padding:0}
 .levels label{display:flex;gap:12px;align-items:flex-start;padding:8px 0;cursor:pointer}
 input[type=radio]{margin-top:4px;width:20px;height:20px;flex:none}
+.readonly{background:#f0f6fc;border-inline-start:4px solid var(--accent);padding:12px;margin:16px 0}.readonly p{margin:0}
 .power{margin:16px 0}
 .power label{display:flex;gap:12px;align-items:flex-start}
 .power .warn{margin:8px 0 0}
@@ -770,13 +876,31 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 		<?php if ( count( $levels ) < 3 ) : ?>
 <p class="hint"><?php esc_html_e( 'The site settings limit what your account can give an app.', 'site-agent-mcp-lite' ); ?></p>
 		<?php endif; ?>
+		<?php if ( '' !== $requested ) : ?>
+<p class="hint">
+			<?php
+			/* translators: %s: access level name, such as "Read only" */
+			echo esc_html( sprintf( __( 'The app asked for: %s.', 'site-agent-mcp-lite' ), Policy::level_label( $requested ) ) );
+			?>
+</p>
+		<?php endif; ?>
 </fieldset>
 		<?php if ( $can_code ) : ?>
 <p class="note"><?php esc_html_e( 'With "Everything the account can do", the app can also install plugins from wordpress.org, which gives it wide control of the site.', 'site-agent-mcp-lite' ); ?></p>
 		<?php endif; ?>
 <p class="warn"><?php esc_html_e( 'Only continue if you started this connection and trust this app.', 'site-agent-mcp-lite' ); ?></p>
+		<?php if ( $offer_read ) : ?>
+<div class="readonly" id="samcp-read-only">
+<p><strong><?php esc_html_e( 'Not sure? Start with read only.', 'site-agent-mcp-lite' ); ?></strong>
+<span class="hint"><?php esc_html_e( 'The app can look at the site but cannot change, publish or delete anything, so a mistake cannot break it. It is the safer way to start: you can connect the app again later with more access.', 'site-agent-mcp-lite' ); ?></span></p>
+</div>
+		<?php endif; ?>
 <div class="actions">
+		<?php // "Allow access" comes first: pressing Enter in the form must approve the level that is ticked. ?>
 <button class="primary" type="submit" name="approve" value="1"><?php esc_html_e( 'Allow access', 'site-agent-mcp-lite' ); ?></button>
+		<?php if ( $offer_read ) : ?>
+<button class="secondary" type="submit" name="approve_read" value="1" aria-describedby="samcp-read-only"><?php esc_html_e( 'Allow read only', 'site-agent-mcp-lite' ); ?></button>
+		<?php endif; ?>
 <button class="secondary" type="submit" name="deny" value="1"><?php esc_html_e( 'Cancel', 'site-agent-mcp-lite' ); ?></button>
 </div>
 </form>
@@ -801,6 +925,10 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 		if ( ! Policy::enabled() ) {
 			self::oauth_error( 'access_denied', 'AI agents are switched off on this site.', 403 );
 		}
+		// Other grant types end here, before any client lookup can fetch a metadata document.
+		if ( ! in_array( $grant, array( 'authorization_code', 'refresh_token' ), true ) ) {
+			self::oauth_error( 'unsupported_grant_type', 'Unsupported grant type.' );
+		}
 		list( $client_id, $secret ) = self::client_credentials();
 		// The code or refresh token must exist for this client before anything else, so an anonymous
 		// request never makes this site fetch a client metadata document.
@@ -811,7 +939,7 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 			$presented = isset( $_POST['refresh_token'] ) ? (string) wp_unslash( $_POST['refresh_token'] ) : '';
 		}
 		$known = '' !== $presented ? Store::find( $presented, 'authorization_code' === $grant ? 'code' : 'refresh' ) : null;
-		if ( in_array( $grant, array( 'authorization_code', 'refresh_token' ), true ) && ( ! $known || ! hash_equals( (string) $known['client_id'], (string) $client_id ) ) ) {
+		if ( ! $known || ! hash_equals( (string) $known['client_id'], (string) $client_id ) ) {
 			self::oauth_error( 'invalid_grant', 'Invalid code or refresh token.' );
 		}
 		$client = self::resolve_client( $client_id );
@@ -891,7 +1019,7 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 			Store::revoke_family( $row['family'] );
 			self::oauth_error( 'invalid_grant', 'This code was already used.' );
 		}
-		self::send_tokens( $row, true );
+		self::send_tokens( $row, true, null, true );
 	}
 
 	/**
@@ -903,7 +1031,7 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 	 */
 	private static function grant_refresh( $client_id, array $client, $refresh ) {
 		$row = Store::find( $refresh, 'refresh' );
-		if ( ! $row || ! hash_equals( $row['client_id'], $client_id ) || $row['revoked_at'] || (int) $row['expires_at'] < time() ) {
+		if ( ! $row || ! hash_equals( $row['client_id'], $client_id ) || $row['revoked_at'] || (int) $row['expires_at'] < time() || Store::family_revoked( $row['family'] ) ) {
 			self::oauth_error( 'invalid_grant', 'Invalid refresh token.' );
 		}
 		if ( ! Policy::enabled() ) {
@@ -924,7 +1052,7 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 			self::oauth_error( 'invalid_grant', 'Tokens are never received by the server: its Authorization header does not reach WordPress. See Site Agent > Overview in WordPress.' );
 		}
 		// However often it is refreshed, a connection ends some months after the person approved it.
-		if ( Store::granted_at( $row ) < time() - Store::GRANT_MAX_AGE ) {
+		if ( Store::grant_expired( $row ) ) {
 			Store::revoke_family( $row['family'] );
 			self::oauth_error( 'invalid_grant', 'This connection is too old. Connect the app again.' );
 		}
@@ -932,7 +1060,8 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 		if ( $confidential ) {
 			self::send_tokens( $row, false, $refresh );
 		}
-		if ( ! Store::consume( $row['id'] ) ) {
+		$consumed = Store::consume( $row['id'] );
+		if ( ! $consumed ) {
 			$fresh = Store::find( $refresh, 'refresh' );
 			if ( ! $fresh || (int) $fresh['used_at'] < time() - Store::REFRESH_GRACE ) {
 				// Replay of a rotated token outside the race window: treat as theft.
@@ -944,7 +1073,7 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 			Store::revoke_family( $row['family'] );
 			self::oauth_error( 'invalid_grant', 'This refresh token was already used.' );
 		}
-		self::send_tokens( $row, true );
+		self::send_tokens( $row, true, null, $consumed );
 	}
 
 	/**
@@ -953,17 +1082,40 @@ button:focus,input:focus,a:focus{outline:2px solid transparent;box-shadow:0 0 0 
 	 * @param array       $row              Source row.
 	 * @param bool        $issue_refresh    Issue a new refresh token.
 	 * @param string|null $existing_refresh Refresh token to return unchanged.
+	 * @param bool        $release          This request consumed the source row: give it back if nothing is issued.
 	 */
-	private static function send_tokens( array $row, $issue_refresh, $existing_refresh = null ) {
+	private static function send_tokens( array $row, $issue_refresh, $existing_refresh = null, $release = false ) {
 		$fields = array_intersect_key( $row, array_flip( array( 'family', 'client_id', 'client_name', 'user_id', 'scope', 'resource', 'granted_at' ) ) );
-		$body   = array(
-			'access_token' => Store::issue( 'access', $fields, Store::ACCESS_TTL ),
+		// An access token never outlives the authorization it descends from.
+		$ttl = min( Store::ACCESS_TTL, Store::granted_at( $row ) + Store::GRANT_MAX_AGE - time() );
+		if ( $ttl <= 0 ) {
+			Store::revoke_family( $row['family'] );
+			self::oauth_error( 'invalid_grant', 'This connection is too old. Connect the app again.' );
+		}
+		$access  = Store::issue( 'access', $fields, $ttl );
+		$refresh = $issue_refresh ? Store::issue( 'refresh', $fields, Store::REFRESH_TTL ) : null;
+		if ( '' === $access || '' === $refresh ) {
+			// Announce a complete pair or nothing, and let the client try again with the same code or token.
+			Store::discard( $access );
+			Store::discard( $refresh );
+			if ( $release ) {
+				Store::release( (int) $row['id'] );
+			}
+			self::oauth_error( 'temporarily_unavailable', 'The site could not store the tokens. Try again in a moment.', 503 );
+		}
+		// A revocation that ran while this request was under way must also cover what it just issued.
+		if ( Store::family_revoked( $row['family'] ) ) {
+			Store::revoke_family( $row['family'] );
+			self::oauth_error( 'invalid_grant', 'This connection was revoked.' );
+		}
+		$body = array(
+			'access_token' => $access,
 			'token_type'   => 'Bearer',
-			'expires_in'   => Store::ACCESS_TTL,
+			'expires_in'   => $ttl,
 			'scope'        => $row['scope'],
 		);
 		if ( $issue_refresh ) {
-			$body['refresh_token'] = Store::issue( 'refresh', $fields, Store::REFRESH_TTL );
+			$body['refresh_token'] = $refresh;
 		} elseif ( null !== $existing_refresh ) {
 			$body['refresh_token'] = $existing_refresh;
 		}

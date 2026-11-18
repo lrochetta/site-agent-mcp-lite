@@ -16,8 +16,10 @@ defined( 'ABSPATH' ) || exit;
  */
 class Security_Audit {
 
-	const LAST_RUN_OPTION = 'samcp_last_security_audit';
-	const AUDIT_EVERY     = 30 * DAY_IN_SECONDS;
+	const LAST_RUN_OPTION     = 'samcp_last_security_audit';
+	const LAST_ATTEMPT_OPTION = 'samcp_last_security_audit_attempt';
+	const AUDIT_EVERY         = 30 * DAY_IN_SECONDS;
+	const RETRY_AFTER         = DAY_IN_SECONDS;
 
 	/** Rules attached to security results. */
 	const RULES = array(
@@ -47,15 +49,29 @@ class Security_Audit {
 	 * @return array
 	 */
 	public static function overview_hint() {
-		$last = (int) get_option( self::LAST_RUN_OPTION, 0 );
-		$due  = time() - $last >= self::AUDIT_EVERY;
-		return array(
-			'last_audit' => $last ? gmdate( 'Y-m-d', $last ) : null,
-			'audit_due'  => $due,
-			'next'       => $due
+		$last    = (int) get_option( self::LAST_RUN_OPTION, 0 );
+		$attempt = get_option( self::LAST_ATTEMPT_OPTION, array() );
+		$tried   = is_array( $attempt ) && isset( $attempt['time'] ) ? (int) $attempt['time'] : 0;
+		$gaps    = is_array( $attempt ) && ! empty( $attempt['could_not_test'] ) ? array_values( (array) $attempt['could_not_test'] ) : array();
+		$due     = time() - $last >= self::AUDIT_EVERY;
+		$hint    = array(
+			'last_audit'   => $last ? gmdate( 'Y-m-d', $last ) : null,
+			'last_attempt' => $tried ? gmdate( 'Y-m-d H:i', $tried ) . ' UTC' : null,
+			'audit_state'  => $due ? 'due' : 'up_to_date',
+			'audit_due'    => $due,
+			'next'         => $due
 				? 'Before other work, run security_audit, which changes nothing, and report the result to the user. Then follow seo_guide topic security.'
 				: 'Audited recently. Run security_audit again before any change to accounts, plugins or security settings.',
 		);
+		// A recent attempt that could not test everything: running it again at every session
+		// start would hit the same gaps, so report them instead until a day has passed.
+		if ( $due && $tried > $last && $gaps && time() - $tried < self::RETRY_AFTER ) {
+			$hint['audit_state']    = 'incomplete';
+			$hint['audit_due']      = false;
+			$hint['could_not_test'] = $gaps;
+			$hint['next']           = 'security_audit ran recently but could not test everything (see could_not_test), so no complete audit is recorded. Tell the user what could not be tested. Run it again once that is fixed, and before any change to accounts, plugins or security settings.';
+		}
+		return $hint;
 	}
 
 	/**
@@ -71,7 +87,7 @@ class Security_Audit {
 		$passed   = array();
 		$errors   = array();
 
-		self::check_updates( $add, $passed );
+		self::check_updates( $add, $passed, $errors );
 		self::check_extensions( $add, $passed );
 		self::check_accounts( $add, $passed );
 		self::check_settings( $add, $passed );
@@ -89,15 +105,31 @@ class Security_Audit {
 				return $order[ $a['severity'] ] <=> $order[ $b['severity'] ];
 			}
 		);
+		// Only a complete audit counts as done: with a check left untested, site_overview keeps asking for one.
+		// Every run also stores its attempt, so site_overview can report the gaps instead of asking again.
+		$complete = ! $errors;
+		$now      = time();
 		Policy::own_write(
-			static function () {
-				update_option( self::LAST_RUN_OPTION, time(), false );
+			static function () use ( $complete, $errors, $now ) {
+				update_option(
+					self::LAST_ATTEMPT_OPTION,
+					array(
+						'time'           => $now,
+						'could_not_test' => $errors,
+					),
+					false
+				);
+				if ( $complete ) {
+					update_option( self::LAST_RUN_OPTION, $now, false );
+				}
 			}
 		);
 
 		return array(
 			'content_trust'  => 'untrusted_site_content',
-			'changed'        => 'Nothing. This audit only reads.',
+			'changed'        => 'Nothing on the site. This audit only reads. A complete audit stores its date, so site_overview stops asking for one for 30 days.',
+			'complete'       => $complete,
+			'date_recorded'  => $complete ? 'yes' : 'no: some checks could not run, so site_overview still says the audit is due. Run it again once they can.',
 			'findings'       => $findings,
 			'passed'         => $passed,
 			'could_not_test' => $errors,
@@ -130,8 +162,23 @@ class Security_Audit {
 	 *
 	 * @param callable $add    Adds a finding.
 	 * @param array    $passed Passed checks.
+	 * @param array    $errors Checks that could not run.
 	 */
-	private static function check_updates( callable $add, array &$passed ) {
+	private static function check_updates( callable $add, array &$passed, array &$errors ) {
+		// WordPress's own update checks. Without them, "no update" would only mean "never checked".
+		$checked = array();
+		foreach ( array(
+			'update_plugins' => 'plugins',
+			'update_themes'  => 'themes',
+			'update_core'    => 'core',
+		) as $transient => $label ) {
+			$data = get_site_transient( $transient );
+			if ( is_object( $data ) && ! empty( $data->last_checked ) ) {
+				$checked[ $label ] = (int) $data->last_checked;
+			} else {
+				$errors[] = 'Updates for ' . $label . ': WordPress has no record of checking for updates, so they cannot be judged. Load the Dashboard > Updates screen, then audit again.';
+			}
+		}
 		$extensions = Plugin_Inspector::extensions();
 		$pending    = array();
 		foreach ( array_merge( $extensions['plugins'], $extensions['themes'] ) as $item ) {
@@ -139,17 +186,20 @@ class Security_Audit {
 				$pending[] = $item['name'] . ' ' . $item['version'] . ' to ' . $item['update_available'];
 			}
 		}
+		$since = static function ( $label ) use ( $checked ) {
+			return ' (checked ' . gmdate( 'Y-m-d H:i', $checked[ $label ] ) . ' UTC)';
+		};
 		if ( $pending ) {
 			$add( 'updates_pending', 'high', implode( '; ', $pending ), 'Update them, one at a time, and check the site after each.', 'agent' );
-		} else {
-			$passed[] = 'Plugins and themes are up to date, according to WordPress\'s last update check.';
+		} elseif ( isset( $checked['plugins'], $checked['themes'] ) ) {
+			$passed[] = 'Plugins and themes are up to date, according to WordPress\'s last update check' . $since( 'plugins' ) . '.';
 		}
-		$core = get_site_transient( 'update_core' );
+		$core  = get_site_transient( 'update_core' );
 		$offer = isset( $core->updates[0] ) ? $core->updates[0] : null;
 		if ( $offer && isset( $offer->response ) && 'upgrade' === $offer->response ) {
 			$add( 'core_update', 'high', 'WordPress ' . get_bloginfo( 'version' ) . ' can be updated to ' . $offer->current . '.', 'Update WordPress core after confirming a backup exists.', 'agent_after_confirmation' );
-		} else {
-			$passed[] = 'WordPress core is up to date, according to its last update check.';
+		} elseif ( isset( $checked['core'] ) ) {
+			$passed[] = 'WordPress core is up to date, according to its last update check' . $since( 'core' ) . '.';
 		}
 	}
 
@@ -304,13 +354,21 @@ class Security_Audit {
 	 * @param array    $errors Checks that could not run.
 	 */
 	private static function check_exposure( callable $add, array &$passed, array &$errors ) {
+		// A refusal (401, 403, 404) is an answer. A server error, a rate limit or no answer
+		// proves nothing, so the check goes to could_not_test instead of passing.
 		$get = static function ( $path ) use ( &$errors ) {
 			try {
-				return Admin_Bridge::send( 'GET', home_url( $path ) );
+				$response = Admin_Bridge::send( 'GET', home_url( $path ) );
 			} catch ( Tool_Error $e ) {
 				$errors[] = $path . ': ' . $e->getMessage();
 				return null;
 			}
+			$status = isset( $response['status'] ) ? (int) $response['status'] : 0;
+			if ( $status < 200 || $status >= 500 || 429 === $status || ! empty( $response['login_redirect'] ) ) {
+				$errors[] = $path . ': the site answered ' . $status . ', so this check could not run.';
+				return null;
+			}
+			return $response;
 		};
 
 		$users = $get( '/wp-json/wp/v2/users' );

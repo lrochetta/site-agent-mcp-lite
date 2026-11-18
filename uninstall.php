@@ -24,10 +24,40 @@ foreach ( array( 'samcp_db_version', 'samcp_power_enabled', 'samcp_extra_redirec
 	delete_option( $samcp_option );
 }
 delete_metadata( 'user', 0, 'samcp_full_info_dismissed', '', true );
+delete_metadata( 'user', 0, 'samcp_release_dismissed', '', true );
+$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE %s", $wpdb->esc_like( 'samcp_az_' ) . '%' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- consent requests never answered, one user meta each
+delete_site_option( 'samcp_release_notice' );
+delete_site_option( 'samcp_update_expiry_seen' );
+delete_site_transient( 'samcp_latest_release' );
+wp_clear_scheduled_hook( 'samcp_release_check' );
 delete_transient( 'samcp_gsc_access_token' );
 delete_transient( 'samcp_gsc_default_site' );
+delete_transient( 'samcp_gtmetrix_tests' );
+delete_option( 'samcp_last_security_audit_attempt' );
 wp_clear_scheduled_hook( 'samcp_daily_cleanup' );
 wp_clear_scheduled_hook( 'samcp_backup_tick' );
+// Site import and export links (Full). Both editions remove them: when Full is deleted while
+// Lite is installed, the lines above return early, and Lite is the last edition left to clean up.
+// An import in progress keeps its folders and tables for the owner.
+delete_option( 'samcp_migration_exports' );
+delete_option( 'samcp_migration_boot' );
+$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $wpdb->esc_like( 'samcp_export_revoked_' ) . '%' ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- revocation marks of export links, one option each
+delete_metadata( 'user', 0, 'samcp_flash_export_link', '', true );
+delete_metadata( 'user', 0, 'samcp_flash_migration_detail', '', true );
+wp_clear_scheduled_hook( 'samcp_migration_tick' );
+if ( is_file( WPMU_PLUGIN_DIR . '/samcp-first-boot.php' ) ) {
+	wp_delete_file( WPMU_PLUGIN_DIR . '/samcp-first-boot.php' );
+}
+// A restorer left at the site root holds the database credentials.
+$samcp_restorers = (array) glob( ABSPATH . 'samcp-restore-*.php' );
+foreach ( $samcp_restorers as $samcp_restorer ) {
+	wp_delete_file( $samcp_restorer );
+}
+// Without its restorer, nothing could end the maintenance a failed restore left: only that one goes.
+$samcp_maintenance = ABSPATH . '.maintenance';
+if ( $samcp_restorers && is_file( $samcp_maintenance ) && false !== strpos( (string) file_get_contents( $samcp_maintenance ), '// Site Agent MCP restore.' ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+	wp_delete_file( $samcp_maintenance );
+}
 // The Authorization pass-through block this plugin may have put in .htaccess.
 require_once ABSPATH . 'wp-admin/includes/file.php';
 $samcp_htaccess = get_home_path() . '.htaccess';
@@ -44,3 +74,4 @@ foreach ( (array) glob( get_home_path() . '.htaccess.samcp-bak-*' ) as $samcp_ba
 }
 // Backup archives are the owner's data: they stay where they are. Only the pointer goes.
 delete_option( 'samcp_backup_dir' );
+delete_transient( 'samcp_backup_exposure' );

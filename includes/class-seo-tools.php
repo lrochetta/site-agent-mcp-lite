@@ -21,6 +21,8 @@ class Seo_Tools {
 	const INDEXNOW_OPTION = 'samcp_indexnow_key';
 	const CRAWL_MAX       = 25;
 	const CRAWL_SECONDS   = 45;
+	const GTMETRIX_TESTS  = 'samcp_gtmetrix_tests';
+	const GTMETRIX_KEEP   = 50;
 
 	/** Rich result types and the properties Google requires. */
 	const SCHEMA_REQUIRED = array(
@@ -159,14 +161,49 @@ class Seo_Tools {
 			'geo_review'     => 'geo',
 		);
 		$guide = self::seo_guide( array( 'topic' => $topic[ $name ] ) );
-		$url   = isset( $args['url'] ) && is_string( $args['url'] ) && '' !== $args['url'] ? $args['url'] : home_url( '/' );
-		$text  = self::prompts()[ $name ]['title'] . ' for ' . $url . ".\n\nFollow these steps in order:\n";
+		$url   = home_url( '/' );
+		$note  = '';
+		// Only a declared argument is used, and only as a URL of this site: free text from
+		// the client never enters the instructions.
+		if ( self::prompts()[ $name ]['arguments'] && isset( $args['url'] ) && '' !== $args['url'] ) {
+			$asked = self::prompt_url( $args['url'] );
+			if ( null === $asked ) {
+				$note = "\n\nThe url argument was not the address of a page of this site, so it was ignored and the home page is used.";
+			} else {
+				$url = $asked;
+			}
+		}
+		$text = self::prompts()[ $name ]['title'] . ' for ' . $url . '.' . $note . "\n\nFollow these steps in order:\n";
 		foreach ( $guide['workflow'] as $index => $step ) {
 			$text .= ( $index + 1 ) . '. ' . $step . "\n";
 		}
 		$rules = isset( $guide['rules'] ) ? $guide['rules'] : self::AGENT_RULES;
 		$text .= "\nRules:\n- " . implode( "\n- ", $rules ) . "\n\nFacts to rely on:\n- " . implode( "\n- ", $guide['facts'] );
 		return isset( $guide['rules'] ) ? $text : $text . "\n\nDo not change the live site until the user has approved the proposed changes.";
+	}
+
+	/**
+	 * A prompt's url argument as a URL of this site, or null when it is not one.
+	 *
+	 * @param mixed $value Argument.
+	 * @return string|null
+	 */
+	private static function prompt_url( $value ) {
+		if ( ! is_string( $value ) || strlen( $value ) > 2048 || preg_match( '/[\s<>"`]/', $value ) ) {
+			return null;
+		}
+		if ( '/' === substr( $value, 0, 1 ) && '/' !== substr( $value, 1, 1 ) ) {
+			$value = home_url( $value );
+		}
+		if ( ! preg_match( '#^https?://[^/?\#]+#i', $value ) || false === wp_parse_url( $value ) ) {
+			return null;
+		}
+		try {
+			Admin_Bridge::assert_same_host( $value );
+		} catch ( Tool_Error $e ) {
+			return null;
+		}
+		return esc_url_raw( $value );
 	}
 
 	/**
@@ -188,13 +225,15 @@ class Seo_Tools {
 			'seo_audit'         => $make( 'Audit a page', 'SEO audit of one page as visitors see it: indexability, title, description, canonical, headings, images, security headers, JSON-LD with the properties Google requires, and E-E-A-T evidence. Each finding says whether the rule comes from Google or is only a convention.', array( 'url' => $str ), array( 'url' ), 'read', 'seo_audit', 'read' ),
 			'site_seo_crawl'    => $make( 'Crawl the site', 'Check pages from the sitemap, 25 at most per call: status, title, description, H1, canonical, noindex, and duplicates in the batch. Call again with the returned next_offset.', array( 'offset' => $int, 'limit' => $int ), array(), 'read', 'site_seo_crawl', 'edit_posts' ),
 			'geo_check'         => $make( 'Check AI search access', 'Which search and AI crawlers robots.txt allows, with what each one does, plus snippet restrictions, sitemap and llms.txt.', array(), array(), 'read', 'geo_check', 'read' ),
-			'performance_test'  => $make( 'Run PageSpeed Insights', 'Google PageSpeed Insights on a public URL, which can be a competitor: Lighthouse scores, main problems, and real-user data when Google has it. Takes up to a minute. The URL is sent to Google.', array( 'url' => $str, 'strategy' => $str + array( 'enum' => array( 'mobile', 'desktop' ) ), 'categories' => $list + array( 'description' => 'performance, accessibility, best-practices, seo. Defaults to all.' ) ), array( 'url' ), 'read', 'performance_test', 'edit_posts' ),
-			'crux_query'        => $make( 'Read real-user metrics', 'Chrome UX Report: LCP, INP and CLS measured on real visitors, with Google\'s rating. Set history to true for the weekly trend. Needs a Google API key.', array( 'url' => $str + array( 'description' => 'A page URL, or an origin such as https://example.com for the whole site.' ), 'form_factor' => $str + array( 'enum' => array( 'PHONE', 'DESKTOP', 'TABLET' ) ), 'history' => $bool ), array( 'url' ), 'read', 'crux_query', 'edit_posts' ),
-			'gtmetrix_test'     => $make( 'Run GTmetrix', 'Start a GTmetrix test on a page of this site, or read its result with test_id. A test takes a while: start it, then call again with test_id. Spends the site owner\'s GTmetrix credits, and the URL is sent to GTmetrix.', array( 'url' => $str, 'test_id' => $str ), array(), 'read', 'gtmetrix_test', 'manage_options' ),
-			'indexnow_submit'   => $make( 'Notify search engines', 'Tell IndexNow engines that pages changed: Bing, Yandex, Naver, Seznam, Yep and Amazon. Google does not take part. Use only for real changes.', array( 'urls' => $list ), array( 'urls' ), 'write', 'indexnow_submit', 'publish_posts' ),
+			'performance_test'  => $make( 'Run PageSpeed Insights', 'Google PageSpeed Insights on a public URL, which can be a competitor: Lighthouse scores, main problems, and real-user data when Google has it. Takes up to a minute. The URL is sent to Google.', array( 'url' => $str, 'strategy' => $str + array( 'enum' => array( 'mobile', 'desktop' ) ), 'categories' => $list + array( 'description' => 'performance, accessibility, best-practices, seo. Defaults to all.' ) ), array( 'url' ), 'read', 'performance_test', 'edit_posts', true ),
+			'crux_query'        => $make( 'Read real-user metrics', 'Chrome UX Report: LCP, INP and CLS measured on real visitors, with Google\'s rating. Set history to true for the weekly trend. Needs a Google API key.', array( 'url' => $str + array( 'description' => 'A page URL, or an origin such as https://example.com for the whole site.' ), 'form_factor' => $str + array( 'enum' => array( 'PHONE', 'DESKTOP', 'TABLET' ) ), 'history' => $bool ), array( 'url' ), 'read', 'crux_query', 'edit_posts', true ),
+			'gtmetrix_test'     => $make( 'Run GTmetrix', 'Start a GTmetrix test on a page of this site, or read its result with test_id. A test takes a while: start it, then follow it with gtmetrix_result. Starting a test spends the site owner\'s GTmetrix credits, and the URL is sent to GTmetrix.', array( 'url' => $str, 'test_id' => $str ), array(), 'write', 'gtmetrix_test', 'manage_options', true ),
+			'gtmetrix_result'   => $make( 'Read a GTmetrix result', 'Progress and report of a GTmetrix test started from this site with gtmetrix_test. Spends no credit.', array( 'test_id' => $str ), array( 'test_id' ), 'read', 'gtmetrix_result', 'manage_options', true ),
+			'indexnow_submit'   => $make( 'Notify search engines', 'Tell IndexNow engines that pages changed: Bing, Yandex, Naver, Seznam, Yep and Amazon. Google does not take part. Use only for real changes.', array( 'urls' => $list ), array( 'urls' ), 'write', 'indexnow_submit', 'publish_posts', true ),
 			'seo_meta_get'      => $make( 'Read a page\'s SEO fields', 'SEO title, description, canonical, focus keyword and noindex of a post or page, from Yoast, Rank Math or SEOPress.', array( 'post_id' => $int ), array( 'post_id' ), 'read', 'seo_meta_get', 'edit_posts' ),
-			'seo_meta_set'      => $make( 'Change a page\'s SEO fields', 'Set SEO title, description, canonical, focus keyword or noindex in the active SEO plugin. Only the fields given change. Journaled for change_undo.', array( 'post_id' => $int, 'title' => $str, 'description' => $str, 'canonical' => $str, 'focus_keyword' => $str, 'noindex' => $bool ), array( 'post_id' ), 'destructive', 'seo_meta_set', 'edit_posts' ),
-			'custom_css_update' => $make( 'Edit the site CSS', 'Read, append to or replace the active theme\'s Additional CSS. Use it for page styling: WordPress can remove style tags from page content. Limit rules to one page with .page-id-N. Journaled for change_undo.', array( 'mode' => $str + array( 'enum' => array( 'read', 'append', 'replace' ) ), 'css' => $str ), array( 'mode' ), 'destructive', 'custom_css_update', 'edit_css' ),
+			'seo_meta_set'      => $make( 'Change a page\'s SEO fields', 'Set SEO title, description, canonical, focus keyword or noindex in the active SEO plugin. Only the fields given change; updated lists the fields really written and unsupported those the plugin has no place for. Refused while someone else edits the post, unless force is true. Journaled for change_undo.', array( 'post_id' => $int, 'title' => $str, 'description' => $str, 'canonical' => $str, 'focus_keyword' => $str, 'noindex' => $bool, 'force' => $bool + array( 'description' => 'Write even though another person has the post open in the editor. Ask the user first.' ) ), array( 'post_id' ), 'destructive', 'seo_meta_set', 'edit_posts' ),
+			'custom_css_get'    => $make( 'Read the site CSS', 'The active theme\'s Additional CSS. Changes nothing.', array(), array(), 'read', 'custom_css_get', 'edit_css' ),
+			'custom_css_update' => $make( 'Edit the site CSS', 'Append to or replace the active theme\'s Additional CSS, or read it. Use it for page styling: WordPress can remove style tags from page content. Limit rules to one page with .page-id-N. replace needs css, and an empty css clears it. Journaled for change_undo.', array( 'mode' => $str + array( 'enum' => array( 'read', 'append', 'replace' ) ), 'css' => $str ), array( 'mode' ), 'destructive', 'custom_css_update', 'edit_css' ),
 			'design_check'      => $make( 'Check a page\'s styling', 'After publishing, check what visitors really get: page classes with no matching CSS, the theme\'s content width, and whether the theme header and footer surround the page. It cannot see the visual result: ask the user or use a browser for that.', array( 'url' => $str ), array( 'url' ), 'read', 'design_check', 'read' ),
 		);
 	}
@@ -500,7 +539,7 @@ class Seo_Tools {
 			'not_checked'       => 'Rendered layout, real speed (use performance_test and crux_query) and backlinks.',
 			'agent_rules'       => self::AGENT_RULES,
 			'next_steps'        => array(
-				Search_Console::is_connected() ? 'Run gsc_inspect_url and gsc_performance on this page: this audit cannot see rankings.' : 'Search Console is not connected, so this audit says nothing about rankings. Tell the user, and suggest connecting it in Tools > Site Agent MCP.',
+				Search_Console::is_connected() ? 'Run gsc_inspect_url and gsc_performance on this page: this audit cannot see rankings.' : 'Search Console is not connected, so this audit says nothing about rankings. Tell the user, and suggest connecting it in Site Agent > Services, or setting up Site Kit by Google.',
 				'Put the eeat.needs_human questions to the user. Do not answer them yourself.',
 				'Propose fixes and wait for approval before changing the live site.',
 			),
@@ -570,29 +609,49 @@ class Seo_Tools {
 	}
 
 	/**
-	 * URLs listed in the site's sitemaps.
+	 * URLs listed in the site's sitemaps, with the sitemaps that could not be read.
+	 * An unreachable sitemap stays distinct from an empty one.
 	 *
-	 * @return string[]
+	 * @return array urls, read, failed (sitemap and reason) and skipped count.
 	 */
 	private static function sitemap_urls() {
-		$robots    = Admin_Bridge::send( 'GET', home_url( '/robots.txt' ) );
-		$sitemaps  = array();
-		if ( preg_match_all( '/^\s*sitemap:\s*(\S+)/mi', $robots['body'], $found ) ) {
-			$sitemaps = $found[1];
+		$sitemaps = array();
+		try {
+			$robots = Admin_Bridge::send( 'GET', home_url( '/robots.txt' ) );
+			if ( 200 === (int) $robots['status'] && preg_match_all( '/^\s*sitemap:\s*(\S+)/mi', $robots['body'], $found ) ) {
+				$sitemaps = $found[1];
+			}
+		} catch ( Tool_Error $e ) {
+			unset( $e ); // No robots.txt: fall back to the WordPress sitemap.
 		}
 		if ( ! $sitemaps ) {
 			$sitemaps = array( home_url( '/wp-sitemap.xml' ) );
 		}
-		$urls = array();
-		$seen = 0;
+		$urls   = array();
+		$read   = 0;
+		$failed = array();
+		$seen   = 0;
 		while ( $sitemaps && $seen < 20 && count( $urls ) < 2000 ) {
 			$sitemap = array_shift( $sitemaps );
 			++$seen;
 			try {
-				$body = Admin_Bridge::send( 'GET', $sitemap )['body'];
+				$response = Admin_Bridge::send( 'GET', $sitemap );
 			} catch ( Tool_Error $e ) {
+				$failed[] = array(
+					'sitemap' => $sitemap,
+					'reason'  => $e->getMessage(),
+				);
 				continue;
 			}
+			if ( 200 !== (int) $response['status'] ) {
+				$failed[] = array(
+					'sitemap' => $sitemap,
+					'reason'  => 'answered ' . (int) $response['status'],
+				);
+				continue;
+			}
+			++$read;
+			$body = $response['body'];
 			preg_match_all( '#<loc>\s*(?:<!\[CDATA\[)?\s*([^<\]\s]+)#i', $body, $locs );
 			if ( false !== stripos( $body, '<sitemapindex' ) ) {
 				$sitemaps = array_merge( $sitemaps, $locs[1] );
@@ -600,7 +659,12 @@ class Seo_Tools {
 				$urls = array_merge( $urls, $locs[1] );
 			}
 		}
-		return array_values( array_unique( $urls ) );
+		return array(
+			'urls'    => array_values( array_unique( $urls ) ),
+			'read'    => $read,
+			'failed'  => $failed,
+			'skipped' => count( $sitemaps ),
+		);
 	}
 
 	/**
@@ -612,7 +676,8 @@ class Seo_Tools {
 	public static function site_seo_crawl( array $args ) {
 		$offset  = isset( $args['offset'] ) ? max( 0, (int) $args['offset'] ) : 0;
 		$limit   = isset( $args['limit'] ) ? min( self::CRAWL_MAX, max( 1, (int) $args['limit'] ) ) : self::CRAWL_MAX;
-		$urls    = self::sitemap_urls();
+		$found   = self::sitemap_urls();
+		$urls    = $found['urls'];
 		$started = time();
 		$pages   = array();
 		$titles  = array();
@@ -662,12 +727,16 @@ class Seo_Tools {
 		return array(
 			'content_trust'      => 'untrusted_site_content',
 			'total_urls'         => count( $urls ),
+			'sitemaps_read'      => $found['read'],
+			'sitemaps_failed'    => count( $found['failed'] ),
+			'sitemap_errors'     => array_slice( $found['failed'], 0, 10 ),
+			'sitemaps_not_read'  => $found['skipped'],
 			'checked'            => count( $pages ),
 			'next_offset'        => $index < count( $urls ) ? $index : null,
 			'pages'              => $pages,
 			'duplicate_titles'   => $repeated( $titles ),
 			'duplicate_descriptions' => $repeated( $descs ),
-			'scope'              => 'Duplicates are within this batch only. Pages missing from the sitemap are not seen.',
+			'scope'              => 'Duplicates are within this batch only. Pages missing from the sitemap are not seen.' . ( $found['failed'] ? ' Some sitemaps could not be read, so total_urls is incomplete: see sitemap_errors.' : '' ),
 		);
 	}
 
@@ -744,33 +813,52 @@ class Seo_Tools {
 	 */
 	public static function geo_check() {
 		$robots = Admin_Bridge::send( 'GET', home_url( '/robots.txt' ) );
-		$groups = 200 === (int) $robots['status'] ? self::robots_groups( $robots['body'] ) : array();
+		$code   = (int) $robots['status'];
+		// RFC 9309: a missing robots.txt (4xx) allows everything; a server error or an
+		// unfollowed redirect tells nothing, so the answer is unknown rather than allowed.
+		if ( 200 === $code ) {
+			$state = 'read';
+		} elseif ( $code >= 400 && $code < 500 ) {
+			$state = 'absent';
+		} else {
+			$state = 'unavailable';
+		}
+		$groups = 'read' === $state ? self::robots_groups( $robots['body'] ) : array();
 		$list   = array();
 		foreach ( self::CRAWLERS as $agent => $purpose ) {
 			$rule   = self::robots_allows( $groups, $agent );
 			$list[] = array(
 				'agent'         => $agent,
 				'purpose'       => $purpose,
-				'home_allowed'  => $rule['allowed'],
+				'home_allowed'  => 'unavailable' === $state ? null : $rule['allowed'],
 				'matched_group' => $rule['group'],
 			);
 		}
-		$llms = Admin_Bridge::send( 'GET', home_url( '/llms.txt' ) );
-		$home = Admin_Bridge::send( 'GET', home_url( '/' ) );
-		$page = Tools::analyse_html( $home['body'] );
+		$llms      = Admin_Bridge::send( 'GET', home_url( '/llms.txt' ) );
+		$home      = Admin_Bridge::send( 'GET', home_url( '/' ) );
+		$page      = Tools::analyse_html( $home['body'] );
+		$llms_type = '';
+		foreach ( $llms['headers'] as $name => $value ) {
+			if ( 'content-type' === strtolower( (string) $name ) ) {
+				$llms_type = strtolower( is_array( $value ) ? (string) reset( $value ) : (string) $value );
+			}
+		}
+		// A theme or a cache can answer 200 with an HTML page for any address.
+		$llms_html = false !== strpos( $llms_type, 'html' ) || preg_match( '/^\s*<(!doctype|html)/i', $llms['body'] );
 		return array(
 			'content_trust'    => 'untrusted_site_content',
 			'robots_txt'       => array(
 				'status' => $robots['status'],
-				'body'   => Store::cut( $robots['body'], 4000 ),
+				'state'  => $state,
+				'body'   => 'read' === $state ? Store::cut( $robots['body'], 4000 ) : '',
 			),
 			'crawlers'         => $list,
-			'scope'            => 'Rules are evaluated for the home page only. A CDN or firewall can also block crawlers, which robots.txt does not show.',
+			'scope'            => 'Rules are evaluated for the home page only. A CDN or firewall can also block crawlers, which robots.txt does not show.' . ( 'unavailable' === $state ? ' robots.txt could not be read, so home_allowed is unknown (null) for every crawler: check again later.' : '' ),
 			'home_meta_robots' => $page['meta_robots'],
 			'home_words_in_html' => $page['approx_words'],
-			'sitemap_declared' => (bool) preg_match( '/^\s*sitemap:/mi', $robots['body'] ),
+			'sitemap_declared' => 'read' === $state ? (bool) preg_match( '/^\s*sitemap:/mi', $robots['body'] ) : null,
 			'llms_txt'         => array(
-				'present' => 200 === (int) $home['status'] && 200 === (int) $llms['status'],
+				'present' => 200 === (int) $llms['status'] && ! $llms_html && '' !== trim( $llms['body'] ),
 				'note'    => 'Optional. Google says it has no effect on Search. See seo_guide topic geo.',
 			),
 			'decision'         => 'Whether to allow training crawlers is the site owner\'s choice. Blocking them does not remove the site from search crawlers.',
@@ -794,15 +882,26 @@ class Seo_Tools {
 		if ( ! preg_match( '#^https?://#i', $url ) ) {
 			$url = home_url( '/' . ltrim( $url, '/' ) );
 		}
+		$all = array( 'performance', 'accessibility', 'best-practices', 'seo' );
+		if ( isset( $args['strategy'] ) && ! in_array( $args['strategy'], array( 'mobile', 'desktop' ), true ) ) {
+			throw new Tool_Error( 'strategy must be mobile or desktop.' );
+		}
+		if ( isset( $args['categories'] ) && ( ! is_array( $args['categories'] ) || ! $args['categories'] || array_diff( $args['categories'], $all ) ) ) {
+			throw new Tool_Error( 'categories takes one or more of: ' . esc_html( implode( ', ', $all ) ) . '.' );
+		}
 		$key      = self::api_key( self::GOOGLE_OPTION, 'SAMCP_GOOGLE_API_KEY' );
 		$strategy = isset( $args['strategy'] ) && 'desktop' === $args['strategy'] ? 'DESKTOP' : 'MOBILE';
-		$chosen   = isset( $args['categories'] ) && is_array( $args['categories'] ) ? $args['categories'] : array( 'performance', 'accessibility', 'best-practices', 'seo' );
+		$chosen   = isset( $args['categories'] ) ? array_values( array_unique( $args['categories'] ) ) : $all;
 		$query    = 'url=' . rawurlencode( $url ) . '&strategy=' . $strategy;
 		foreach ( $chosen as $category ) {
 			$query .= '&category=' . rawurlencode( strtoupper( str_replace( '-', '_', (string) $category ) ) );
 		}
 		if ( '' !== $key ) {
 			$query .= '&key=' . rawurlencode( $key );
+		}
+		// No key here but Site Kit by Google runs PageSpeed Insights: use it, nothing to set up twice.
+		if ( '' === $key && Site_Kit::pagespeed_ready() ) {
+			return self::pagespeed_report( Site_Kit::pagespeed( $url, $strategy ), $url, $strategy, $chosen, 'site_kit' );
 		}
 		$response = wp_remote_get( 'https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed?' . $query, array( 'timeout' => 100 ) );
 		if ( is_wp_error( $response ) ) {
@@ -811,14 +910,36 @@ class Seo_Tools {
 		$status = (int) wp_remote_retrieve_response_code( $response );
 		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
 		if ( 429 === $status && '' === $key ) {
-			throw new Tool_Error( 'Google refused the request without an API key. An administrator can add a free key in Tools > Site Agent MCP.' );
+			throw new Tool_Error( 'Google refused the request without an API key. An administrator can add a free key in Site Agent > Services, or set up Site Kit by Google.' );
 		}
 		if ( 200 !== $status || ! isset( $data['lighthouseResult'] ) ) {
 			throw new Tool_Error( 'PageSpeed Insights answered ' . (int) $status . ': ' . esc_html( self::clean( isset( $data['error']['message'] ) ? $data['error']['message'] : 'no result', $key ) ) );
 		}
+		return self::pagespeed_report( $data, $url, $strategy, $chosen, 'google' );
+	}
+
+	/**
+	 * Shape a PageSpeed Insights answer, from Google or through Site Kit.
+	 *
+	 * @param array  $data     API answer.
+	 * @param string $url      Page tested.
+	 * @param string $strategy MOBILE or DESKTOP.
+	 * @param array  $chosen   Categories asked for.
+	 * @param string $source   google or site_kit.
+	 * @return array
+	 * @throws Tool_Error When the answer has no report.
+	 */
+	private static function pagespeed_report( array $data, $url, $strategy, array $chosen, $source ) {
+		if ( ! isset( $data['lighthouseResult'] ) || ! is_array( $data['lighthouseResult'] ) ) {
+			throw new Tool_Error( 'PageSpeed Insights returned no report.' );
+		}
 		$lighthouse = $data['lighthouseResult'];
 		$scores     = array();
-		foreach ( (array) $lighthouse['categories'] as $id => $category ) {
+		foreach ( isset( $lighthouse['categories'] ) ? (array) $lighthouse['categories'] : array() as $id => $category ) {
+			// Site Kit runs its own set of categories: keep the ones asked for.
+			if ( ! in_array( $id, $chosen, true ) ) {
+				continue;
+			}
 			$scores[ $id ] = isset( $category['score'] ) ? (int) round( $category['score'] * 100 ) : null;
 		}
 		$metrics = array();
@@ -828,7 +949,7 @@ class Seo_Tools {
 			}
 		}
 		$problems = array();
-		foreach ( (array) $lighthouse['audits'] as $id => $audit ) {
+		foreach ( isset( $lighthouse['audits'] ) ? (array) $lighthouse['audits'] : array() as $id => $audit ) {
 			if ( isset( $audit['score'] ) && is_numeric( $audit['score'] ) && $audit['score'] < 0.9 ) {
 				$problems[] = array(
 					'id'     => $id,
@@ -865,6 +986,8 @@ class Seo_Tools {
 			'problems'      => array_slice( $problems, 0, 15 ),
 			'field_page'    => $field( isset( $data['loadingExperience'] ) ? $data['loadingExperience'] : array() ),
 			'field_origin'  => $field( isset( $data['originLoadingExperience'] ) ? $data['originLoadingExperience'] : array() ),
+			'source'        => $source,
+			'categories_not_returned' => array_values( array_diff( $chosen, array_keys( $scores ) ) ),
 			'note'          => 'Lab scores vary between runs. Empty field data means Chrome has too few real visits for this page.',
 		);
 	}
@@ -879,11 +1002,14 @@ class Seo_Tools {
 	public static function crux_query( array $args ) {
 		$key = self::api_key( self::GOOGLE_OPTION, 'SAMCP_GOOGLE_API_KEY' );
 		if ( '' === $key ) {
-			throw new Tool_Error( 'This needs a Google API key, which an administrator can add in Tools > Site Agent MCP.' );
+			throw new Tool_Error( 'This needs a Google API key, which an administrator can add in Site Agent > Services.' );
 		}
-		$url = isset( $args['url'] ) ? (string) $args['url'] : '';
+		$url = isset( $args['url'] ) && is_string( $args['url'] ) ? $args['url'] : '';
 		if ( ! preg_match( '#^https?://#i', $url ) ) {
 			throw new Tool_Error( 'url must be a full URL or an origin.' );
+		}
+		if ( ! empty( $args['form_factor'] ) && ! in_array( $args['form_factor'], array( 'PHONE', 'DESKTOP', 'TABLET' ), true ) ) {
+			throw new Tool_Error( 'form_factor must be PHONE, DESKTOP or TABLET.' );
 		}
 		$path    = (string) wp_parse_url( $url, PHP_URL_PATH );
 		$body    = array( 'metrics' => array( 'largest_contentful_paint', 'interaction_to_next_paint', 'cumulative_layout_shift', 'experimental_time_to_first_byte' ) );
@@ -916,6 +1042,9 @@ class Seo_Tools {
 		}
 		if ( 200 !== $status ) {
 			throw new Tool_Error( 'The Chrome UX Report answered ' . (int) $status . ': ' . esc_html( self::clean( isset( $data['error']['message'] ) ? $data['error']['message'] : 'no result', $key ) ) );
+		}
+		if ( ! isset( $data['record']['metrics'] ) || ! is_array( $data['record']['metrics'] ) ) {
+			throw new Tool_Error( 'The Chrome UX Report answered without metrics. Try again later.' );
 		}
 		$limits  = array(
 			'largest_contentful_paint'  => array( 2500, 4000, 'ms' ),
@@ -950,55 +1079,121 @@ class Seo_Tools {
 	}
 
 	/**
-	 * Start a GTmetrix test or read its result.
+	 * Key and request template for the GTmetrix API.
+	 *
+	 * @return array Key and request arguments.
+	 * @throws Tool_Error Without a key.
+	 */
+	private static function gtmetrix_request() {
+		$key = self::api_key( self::GTMETRIX_OPTION, 'SAMCP_GTMETRIX_API_KEY' );
+		if ( '' === $key ) {
+			throw new Tool_Error( 'This needs a GTmetrix API key, which an administrator can add in Site Agent > Services.' );
+		}
+		return array(
+			$key,
+			array(
+				'timeout'     => 30,
+				'redirection' => 0,
+				'headers'     => array(
+					'Authorization' => 'Basic ' . base64_encode( $key . ':' ), // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
+					'Content-Type'  => 'application/vnd.api+json',
+				),
+			),
+		);
+	}
+
+	/**
+	 * GTmetrix test ids started from this site, newest last.
+	 *
+	 * @return string[]
+	 */
+	private static function gtmetrix_known() {
+		$known = get_transient( self::GTMETRIX_TESTS );
+		return is_array( $known ) ? array_values( array_filter( $known, 'is_string' ) ) : array();
+	}
+
+	/**
+	 * Start a GTmetrix test, which spends credits, or read a result by test_id.
 	 *
 	 * @param array $args Arguments.
 	 * @return array
 	 * @throws Tool_Error On missing key or API failure.
 	 */
 	public static function gtmetrix_test( array $args ) {
-		$key = self::api_key( self::GTMETRIX_OPTION, 'SAMCP_GTMETRIX_API_KEY' );
-		if ( '' === $key ) {
-			throw new Tool_Error( 'This needs a GTmetrix API key, which an administrator can add in Tools > Site Agent MCP.' );
+		list( $key, $request ) = self::gtmetrix_request();
+		if ( ! empty( $args['test_id'] ) ) {
+			return self::gtmetrix_read( (string) $args['test_id'], $key, $request );
 		}
-		$base    = 'https://gtmetrix.com/api/2.0/';
-		$request = array(
-			'timeout'     => 30,
-			'redirection' => 0,
-			'headers'     => array(
-				'Authorization' => 'Basic ' . base64_encode( $key . ':' ), // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
-				'Content-Type'  => 'application/vnd.api+json',
-			),
+		$url             = self::site_url_arg( $args );
+		$request['body'] = wp_json_encode(
+			array(
+				'data' => array(
+					'type'       => 'test',
+					'attributes' => array( 'url' => $url ),
+				),
+			)
 		);
-
-		if ( empty( $args['test_id'] ) ) {
-			$url             = self::site_url_arg( $args );
-			$request['body'] = wp_json_encode(
-				array(
-					'data' => array(
-						'type'       => 'test',
-						'attributes' => array( 'url' => $url ),
-					),
-				)
-			);
-			$response        = wp_remote_post( $base . 'tests', $request );
-			if ( is_wp_error( $response ) ) {
-				throw new Tool_Error( 'GTmetrix did not answer: ' . esc_html( self::clean( $response->get_error_message(), $key ) ) );
-			}
-			$status = (int) wp_remote_retrieve_response_code( $response );
-			$data   = json_decode( wp_remote_retrieve_body( $response ), true );
-			if ( 202 !== $status ) {
-				throw new Tool_Error( 'GTmetrix answered ' . (int) $status . ': ' . esc_html( self::clean( isset( $data['errors'][0]['detail'] ) ? $data['errors'][0]['detail'] : 'test not started', $key ) ) );
-			}
-			return array(
-				'state'        => 'started',
-				'test_id'      => $data['data']['id'],
-				'credits_left' => isset( $data['meta']['credits_left'] ) ? $data['meta']['credits_left'] : null,
-				'next'         => 'Call again with this test_id in a little while.',
-			);
+		$response        = wp_remote_post( 'https://gtmetrix.com/api/2.0/tests', $request );
+		if ( is_wp_error( $response ) ) {
+			throw new Tool_Error( 'GTmetrix did not answer: ' . esc_html( self::clean( $response->get_error_message(), $key ) ) );
 		}
+		$status = (int) wp_remote_retrieve_response_code( $response );
+		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( 202 !== $status ) {
+			throw new Tool_Error( 'GTmetrix answered ' . (int) $status . ': ' . esc_html( self::clean( isset( $data['errors'][0]['detail'] ) ? $data['errors'][0]['detail'] : 'test not started', $key ) ) );
+		}
+		$id = isset( $data['data']['id'] ) && is_scalar( $data['data']['id'] ) ? preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $data['data']['id'] ) : '';
+		if ( '' === $id ) {
+			throw new Tool_Error( 'GTmetrix accepted the test but returned no test id. Check the GTmetrix dashboard before starting another one.' );
+		}
+		// Remember the tests started here, so gtmetrix_result only reads this site's own tests.
+		$known   = array_diff( self::gtmetrix_known(), array( $id ) );
+		$known[] = $id;
+		$known   = array_slice( array_values( $known ), -self::GTMETRIX_KEEP );
+		Policy::own_write(
+			static function () use ( $known ) {
+				set_transient( self::GTMETRIX_TESTS, $known, 30 * DAY_IN_SECONDS );
+			}
+		);
+		return array(
+			'state'        => 'started',
+			'test_id'      => $id,
+			'credits_left' => isset( $data['meta']['credits_left'] ) ? $data['meta']['credits_left'] : null,
+			'next'         => 'Call gtmetrix_result with this test_id in a little while. It spends no credit.',
+		);
+	}
 
-		$id = preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $args['test_id'] );
+	/**
+	 * Read a GTmetrix test started from this site. Never starts a test.
+	 *
+	 * @param array $args Arguments.
+	 * @return array
+	 * @throws Tool_Error On an unknown test, missing key or API failure.
+	 */
+	public static function gtmetrix_result( array $args ) {
+		$id = isset( $args['test_id'] ) && is_string( $args['test_id'] ) ? preg_replace( '/[^A-Za-z0-9_-]/', '', $args['test_id'] ) : '';
+		if ( '' === $id ) {
+			throw new Tool_Error( 'test_id is required. Start a test with gtmetrix_test first.' );
+		}
+		if ( ! in_array( $id, self::gtmetrix_known(), true ) ) {
+			throw new Tool_Error( 'This test was not started from this site, or is older than 30 days. Only tests started with gtmetrix_test here can be read.' );
+		}
+		list( $key, $request ) = self::gtmetrix_request();
+		return self::gtmetrix_read( $id, $key, $request );
+	}
+
+	/**
+	 * Progress or report of a GTmetrix test.
+	 *
+	 * @param string $test_id Test id.
+	 * @param string $key     API key, kept out of messages.
+	 * @param array  $request Request arguments.
+	 * @return array
+	 * @throws Tool_Error On API failure or an answer without the expected fields.
+	 */
+	private static function gtmetrix_read( $test_id, $key, array $request ) {
+		$base     = 'https://gtmetrix.com/api/2.0/';
+		$id       = preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $test_id );
 		$response = wp_remote_get( $base . 'tests/' . $id, $request );
 		if ( is_wp_error( $response ) ) {
 			throw new Tool_Error( 'GTmetrix did not answer: ' . esc_html( self::clean( $response->get_error_message(), $key ) ) );
@@ -1006,7 +1201,10 @@ class Seo_Tools {
 		$status = (int) wp_remote_retrieve_response_code( $response );
 		$data   = json_decode( wp_remote_retrieve_body( $response ), true );
 		if ( 200 === $status ) {
-			$state = isset( $data['data']['attributes']['state'] ) ? $data['data']['attributes']['state'] : 'unknown';
+			if ( ! isset( $data['data']['attributes']['state'] ) || ! is_string( $data['data']['attributes']['state'] ) ) {
+				throw new Tool_Error( 'GTmetrix answered without the state of the test. Try again later.' );
+			}
+			$state = $data['data']['attributes']['state'];
 			if ( 'error' === $state ) {
 				throw new Tool_Error( 'The GTmetrix test failed: ' . esc_html( isset( $data['data']['attributes']['error'] ) ? $data['data']['attributes']['error'] : 'no detail' ) );
 			}
@@ -1021,13 +1219,20 @@ class Seo_Tools {
 			throw new Tool_Error( 'GTmetrix answered ' . (int) $status . ': ' . esc_html( self::clean( isset( $data['errors'][0]['detail'] ) ? $data['errors'][0]['detail'] : 'no result', $key ) ) );
 		}
 
-		$report_id = 303 === $status ? basename( (string) wp_remote_retrieve_header( $response, 'location' ) ) : ( isset( $data['data']['attributes']['report'] ) ? $data['data']['attributes']['report'] : '' );
-		$report    = wp_remote_get( $base . 'reports/' . preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $report_id ), $request );
+		$report_id = 303 === $status ? basename( (string) wp_remote_retrieve_header( $response, 'location' ) ) : ( isset( $data['data']['attributes']['report'] ) && is_scalar( $data['data']['attributes']['report'] ) ? (string) $data['data']['attributes']['report'] : '' );
+		$report_id = preg_replace( '/[^A-Za-z0-9_-]/', '', (string) $report_id );
+		if ( '' === $report_id ) {
+			throw new Tool_Error( 'GTmetrix says the test is complete but gave no report id. Try again later.' );
+		}
+		$report = wp_remote_get( $base . 'reports/' . $report_id, $request );
 		if ( is_wp_error( $report ) || 200 !== (int) wp_remote_retrieve_response_code( $report ) ) {
 			throw new Tool_Error( 'The GTmetrix report could not be read.' );
 		}
-		$body       = json_decode( wp_remote_retrieve_body( $report ), true );
-		$attributes = isset( $body['data']['attributes'] ) ? $body['data']['attributes'] : array();
+		$body = json_decode( wp_remote_retrieve_body( $report ), true );
+		if ( empty( $body['data']['attributes'] ) || ! is_array( $body['data']['attributes'] ) ) {
+			throw new Tool_Error( 'The GTmetrix report came back empty or unreadable. Try again later.' );
+		}
+		$attributes = $body['data']['attributes'];
 		return array(
 			'state'   => 'completed',
 			'test_id' => $id,
@@ -1245,8 +1450,24 @@ class Seo_Tools {
 		if ( ! $fields ) {
 			throw new Tool_Error( 'Give at least one field to change.' );
 		}
+		self::assert_not_locked( $post_id, $args );
+		$plugins     = self::seo_plugins();
+		$unsupported = array();
+		foreach ( array_keys( $fields ) as $field ) {
+			$supported = false;
+			foreach ( $plugins as $plugin ) {
+				$supported = $supported || isset( self::META_KEYS[ $plugin ][ $field ] );
+			}
+			if ( ! $supported ) {
+				$unsupported[] = $field;
+			}
+		}
+		// Nothing journaled when no field can be written, so there is no empty change to undo.
+		if ( count( $unsupported ) === count( $fields ) ) {
+			throw new Tool_Error( 'The active SEO plugin has no place for: ' . esc_html( implode( ', ', $unsupported ) ) . '. Nothing was written.' );
+		}
 		$before = array();
-		foreach ( self::seo_plugins() as $plugin ) {
+		foreach ( $plugins as $plugin ) {
 			foreach ( $fields as $field => $value ) {
 				if ( ! isset( self::META_KEYS[ $plugin ][ $field ] ) ) {
 					continue; // This plugin has no such field, e.g. focus keyword in The SEO Framework.
@@ -1267,13 +1488,43 @@ class Seo_Tools {
 				}
 			}
 		}
+		// What the fields hold now, so change_undo leaves alone a field someone edited since.
+		foreach ( array_keys( $before ) as $key ) {
+			$before[ $key ]['now'] = Journal::fingerprint( metadata_exists( 'post', $post_id, $key ) ? get_post_meta( $post_id, $key, true ) : null );
+		}
 		$change = Journal::record( 'seo_meta_set', 'post ' . $post_id, array( 'post_meta' => array( $post_id => $before ) ) );
 		return array(
-			'post_id'   => $post_id,
-			'updated'   => array_keys( $fields ),
-			'change_id' => $change,
-			'next'      => 'A page cache can delay the change. Check the public page with seo_audit.',
+			'post_id'     => $post_id,
+			'updated'     => array_values( array_diff( array_keys( $fields ), $unsupported ) ),
+			'unsupported' => $unsupported,
+			'plugins'     => $plugins,
+			'change_id'   => $change,
+			'next'        => 'A page cache can delay the change. Check the public page with seo_audit.',
 		);
+	}
+
+	/**
+	 * Refuse to write to a post that another person has open in the editor, unless forced.
+	 * Public so that other content tools can apply the same rule.
+	 *
+	 * @param int   $post_id Post.
+	 * @param array $args    Tool arguments, where force may be true.
+	 * @throws Tool_Error When the post is locked by someone else.
+	 */
+	public static function assert_not_locked( $post_id, array $args ) {
+		if ( ! empty( $args['force'] ) && true === $args['force'] ) {
+			return;
+		}
+		if ( ! function_exists( 'wp_check_post_lock' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/post.php';
+		}
+		$holder = wp_check_post_lock( $post_id );
+		if ( ! $holder ) {
+			return;
+		}
+		$user = get_userdata( $holder );
+		$name = $user ? $user->display_name : 'another user';
+		throw new Tool_Error( 'Post ' . (int) $post_id . ' is locked by ' . esc_html( $name ) . ', who has it open in the editor. Their next save could overwrite this change. Ask the user, then call again with force set to true if they agree.' );
 	}
 
 	/**
@@ -1308,16 +1559,33 @@ class Seo_Tools {
 	/**
 	 * Write the theme's Additional CSS, past the filter that would encode ">" in selectors.
 	 *
-	 * @param string $css CSS.
+	 * @param string $css        CSS.
+	 * @param string $stylesheet Theme the CSS belongs to; the active theme when empty.
 	 * @throws Tool_Error On failure.
 	 */
-	public static function write_custom_css( $css ) {
+	public static function write_custom_css( $css, $stylesheet = '' ) {
 		kses_remove_filters();
-		$result = wp_update_custom_css_post( $css, array( 'stylesheet' => get_stylesheet() ) );
+		$result = wp_update_custom_css_post( $css, array( 'stylesheet' => '' === $stylesheet ? get_stylesheet() : $stylesheet ) );
 		kses_init();
 		if ( is_wp_error( $result ) ) {
 			throw new Tool_Error( 'The CSS was refused: ' . esc_html( $result->get_error_message() ) );
 		}
+	}
+
+	/**
+	 * Read the site CSS, for read-only connections too.
+	 *
+	 * @return array
+	 * @throws Tool_Error On a multisite network, for anyone but a super admin.
+	 */
+	public static function custom_css_get() {
+		if ( is_multisite() && ! is_super_admin() ) {
+			throw new Tool_Error( 'On a multisite network, only super admins can read the site CSS here.' );
+		}
+		return array(
+			'content_trust' => 'untrusted_site_content',
+			'css'           => wp_get_custom_css(),
+		);
 	}
 
 	/**
@@ -1331,12 +1599,22 @@ class Seo_Tools {
 		if ( is_multisite() && ! is_super_admin() ) {
 			throw new Tool_Error( 'On a multisite network, only super admins can edit the site CSS here.' );
 		}
+		// Every check comes before the journal and the write: a rejected call leaves the CSS as it was.
+		$mode = isset( $args['mode'] ) ? $args['mode'] : null;
+		if ( ! in_array( $mode, array( 'read', 'append', 'replace' ), true ) ) {
+			throw new Tool_Error( 'mode must be read, append or replace. Nothing was written.' );
+		}
 		$current = wp_get_custom_css();
-		$mode    = isset( $args['mode'] ) ? (string) $args['mode'] : 'read';
 		if ( 'read' === $mode ) {
 			return array( 'css' => $current );
 		}
-		$css = isset( $args['css'] ) ? (string) $args['css'] : '';
+		if ( ! isset( $args['css'] ) || ! is_string( $args['css'] ) ) {
+			throw new Tool_Error( 'css is required for ' . esc_html( $mode ) . '. To clear the site CSS, use replace with an empty css. Nothing was written.' );
+		}
+		$css = $args['css'];
+		if ( 'append' === $mode && '' === trim( $css ) ) {
+			throw new Tool_Error( 'css is empty, so there is nothing to append.' );
+		}
 		// CSS has no use for "<". Refusing it keeps markup out, so this cannot become a script injection.
 		if ( false !== strpos( $css, '<' ) ) {
 			throw new Tool_Error( 'CSS must not contain "<". Send only the rules, without a style tag.' );
@@ -1344,9 +1622,21 @@ class Seo_Tools {
 		if ( substr_count( $css, '{' ) !== substr_count( $css, '}' ) ) {
 			throw new Tool_Error( 'The braces in this CSS do not balance. Nothing was written.' );
 		}
-		$new    = 'append' === $mode ? rtrim( $current ) . "\n" . $css : $css;
-		$change = Journal::record( 'custom_css_update', get_stylesheet(), array( 'custom_css' => array( 'css' => $current ) ) );
-		self::write_custom_css( $new );
+		$new        = 'append' === $mode ? rtrim( $current ) . "\n" . $css : $css;
+		$stylesheet = get_stylesheet();
+		self::write_custom_css( $new, $stylesheet );
+		// Journaled once written, with its theme and what it now holds: change_undo restores that theme only, and only if nobody edited its CSS since.
+		$change = Journal::record(
+			'custom_css_update',
+			$stylesheet,
+			array(
+				'custom_css' => array(
+					'css'        => $current,
+					'stylesheet' => $stylesheet,
+					'now'        => Journal::fingerprint( wp_get_custom_css( $stylesheet ) ),
+				),
+			)
+		);
 		return array(
 			'bytes'     => strlen( wp_get_custom_css() ),
 			'change_id' => $change,

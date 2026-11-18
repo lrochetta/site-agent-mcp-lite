@@ -26,9 +26,14 @@ class MCP_Server {
 	const ERR_PARAMS         = -32602;
 	const ERR_HEADER         = -32020;
 	const ERR_VERSION        = -32022;
+	const ERR_RATE           = -32029;
+	const MAX_BATCH          = 20;
 	const META_VERSION       = 'io.modelcontextprotocol/protocolVersion';
 	const META_CAPABILITIES  = 'io.modelcontextprotocol/clientCapabilities';
 	const META_SERVER_INFO   = 'io.modelcontextprotocol/serverInfo';
+
+	/** Tools that hold the server for long or call outside services: they have their own per-connection ceiling. */
+	const LONG_TOOLS = array( 'site_seo_crawl', 'performance_test', 'gtmetrix_test', 'backup_create' );
 
 	/**
 	 * Validated token for this request.
@@ -51,6 +56,13 @@ class MCP_Server {
 	 */
 	private static $dispatching = false;
 
+	/**
+	 * Name of the image format an agent uploaded whose location data could not be checked, if any.
+	 *
+	 * @var string
+	 */
+	private static $unchecked_location = '';
+
 	/** Register hooks. */
 	public static function boot() {
 		add_action( 'rest_api_init', array( __CLASS__, 'register_route' ) );
@@ -62,6 +74,11 @@ class MCP_Server {
 		add_filter( 'rest_exposed_cors_headers', array( __CLASS__, 'exposed_headers' ) );
 		// A token signs its user in for the MCP route only: any other route WordPress dispatches is refused.
 		add_filter( 'rest_pre_dispatch', array( __CLASS__, 'only_own_route' ), 0, 3 );
+		// Pictures an agent uploads must not publish where they were taken.
+		add_filter( 'wp_handle_upload_prefilter', array( __CLASS__, 'strip_gps' ) );
+		add_filter( 'wp_handle_sideload_prefilter', array( __CLASS__, 'strip_gps' ) );
+		// Formats whose location data is not removed get a notice in the media response the agent reads.
+		add_filter( 'rest_prepare_attachment', array( __CLASS__, 'location_notice' ) );
 	}
 
 	/**
@@ -261,6 +278,11 @@ class MCP_Server {
 		if ( untrailingslashit( $row['resource'] ) !== untrailingslashit( OAuth::resource() ) ) {
 			return null;
 		}
+		// A refresh racing a revocation can insert rows after it: the family mark decides.
+		// The authorization's own end date counts too, not only the token's hour.
+		if ( Store::family_revoked( $row['family'] ) || Store::grant_expired( $row ) ) {
+			return null;
+		}
 		self::$token = $row;
 		return $row;
 	}
@@ -272,9 +294,52 @@ class MCP_Server {
 	 * @return bool
 	 */
 	private static function origin_allowed( $origin ) {
-		$host    = strtolower( (string) wp_parse_url( $origin, PHP_URL_HOST ) );
-		$allowed = array( strtolower( (string) wp_parse_url( home_url(), PHP_URL_HOST ) ), 'localhost', '127.0.0.1', '[::1]', 'claude.ai', 'claude.com', 'chatgpt.com', 'gemini.google.com', 'antigravity.google' );
-		return (bool) apply_filters( 'samcp_origin_allowed', in_array( $host, $allowed, true ), $origin );
+		$normalized = self::normalize_origin( $origin );
+		$allowed    = false;
+		if ( '' !== $normalized ) {
+			$host = (string) wp_parse_url( $normalized, PHP_URL_HOST );
+			// Exception: apps on this computer (MCP Inspector, desktop clients) pick their own port and scheme.
+			$allowed = in_array( $host, array( 'localhost', '127.0.0.1', '[::1]' ), true ) || in_array( $normalized, self::allowed_origins(), true );
+		}
+		return (bool) apply_filters( 'samcp_origin_allowed', $allowed, $origin );
+	}
+
+	/**
+	 * Browser origins allowed besides loopback: this site, and the web apps of known AI clients.
+	 * Scheme, host and port are all compared.
+	 *
+	 * @return string[]
+	 */
+	private static function allowed_origins() {
+		$origins = array( 'https://claude.ai', 'https://claude.com', 'https://chatgpt.com', 'https://gemini.google.com', 'https://antigravity.google' );
+		foreach ( array( home_url(), site_url() ) as $own ) {
+			$origins[] = self::normalize_origin( $own );
+			// The same site reached over HTTPS, behind a proxy that WordPress does not see.
+			$origins[] = self::normalize_origin( preg_replace( '#^http://#i', 'https://', $own ) );
+		}
+		return array_values( array_filter( array_unique( $origins ) ) );
+	}
+
+	/**
+	 * Origin as scheme://host[:port], lowercase, without default ports.
+	 *
+	 * @param string $url Origin header or URL.
+	 * @return string Empty when it is not an http or https origin.
+	 */
+	private static function normalize_origin( $url ) {
+		$parts = wp_parse_url( trim( (string) $url ) );
+		if ( ! is_array( $parts ) || empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+			return '';
+		}
+		$scheme = strtolower( $parts['scheme'] );
+		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
+			return '';
+		}
+		$port = isset( $parts['port'] ) ? (int) $parts['port'] : 0;
+		if ( ( 'https' === $scheme && 443 === $port ) || ( 'http' === $scheme && 80 === $port ) ) {
+			$port = 0;
+		}
+		return $scheme . '://' . strtolower( $parts['host'] ) . ( $port ? ':' . $port : '' );
 	}
 
 	/**
@@ -390,6 +455,10 @@ class MCP_Server {
 			if ( '' !== $header_version && '2025-03-26' !== $header_version ) {
 				return self::error( null, self::ERR_PARAMS, 'Batches are not supported by this protocol version.', 400 );
 			}
+			// Each message runs and its answer stays in memory until the batch ends, so batches are kept small.
+			if ( count( $message ) > self::MAX_BATCH ) {
+				return self::error( null, self::ERR_PARAMS, 'A batch holds at most ' . self::MAX_BATCH . ' messages. Send the others in another request.', 400 );
+			}
 			return self::handle_batch( $message, $token );
 		}
 
@@ -494,7 +563,8 @@ class MCP_Server {
 						'instructions'      => self::instructions(),
 						'_meta'             => array( self::META_SERVER_INFO => self::server_info() ),
 						'ttlMs'             => 3600000,
-						'cacheScope'        => 'public',
+						// The instructions describe this connection's access level: never share them.
+						'cacheScope'        => 'private',
 					)
 				);
 			case 'tools/list':
@@ -650,11 +720,196 @@ class MCP_Server {
 		if ( ! Tools::exists( $name ) ) {
 			return self::error( $id, self::ERR_PARAMS, 'Unknown tool: ' . $name, $modern ? 400 : 200 );
 		}
+		$wait = self::throttled( $token, $name );
+		if ( $wait ) {
+			$response = self::error( $id, self::ERR_RATE, sprintf( 'Too many calls on this connection. Wait %d seconds, then try again.', $wait ), 429, array( 'retryAfter' => $wait ) );
+			$response->header( 'Retry-After', (string) $wait );
+			return $response;
+		}
 		$result = Tools::call( $name, $arguments, $token );
 		if ( $modern ) {
 			$result['resultType'] = 'complete';
 		}
 		return self::result( $id, $result );
+	}
+
+	/**
+	 * Per-connection limits, so one connection cannot hold a shared host: every tool call
+	 * counts, and long operations (crawls, external tests, backups) have a lower ceiling.
+	 * Filters: samcp_calls_per_minute and samcp_long_calls_per_minute, 0 to switch a limit off.
+	 *
+	 * @param array  $token Token.
+	 * @param string $name  Tool.
+	 * @return int Seconds to wait, or 0.
+	 */
+	private static function throttled( array $token, $name ) {
+		$family = (string) $token['family'];
+		$wait   = Store::throttle( 'calls:' . $family, (int) apply_filters( 'samcp_calls_per_minute', 600, $token ), MINUTE_IN_SECONDS );
+		if ( ! $wait && in_array( $name, self::LONG_TOOLS, true ) ) {
+			$wait = Store::throttle( 'long:' . $family, (int) apply_filters( 'samcp_long_calls_per_minute', 20, $token, $name ), MINUTE_IN_SECONDS );
+		}
+		return $wait;
+	}
+
+	/**
+	 * Remove GPS coordinates from JPEG files uploaded by an agent, before WordPress stores them.
+	 * Orientation, colour profile and other metadata stay. Filter samcp_strip_gps to keep them.
+	 *
+	 * @param array $file Upload, as wp_handle_upload_prefilter and wp_handle_sideload_prefilter pass it.
+	 * @return array
+	 */
+	public static function strip_gps( $file ) {
+		if ( ! is_array( $file ) || empty( $file['tmp_name'] ) || ! Policy::current() || ! apply_filters( 'samcp_strip_gps', true, $file ) ) {
+			return $file;
+		}
+		$path = (string) $file['tmp_name'];
+		$data = is_readable( $path ) ? file_get_contents( $path ) : false; // phpcs:ignore WordPress.WP.AlternativeFunctions
+		if ( false === $data ) {
+			return $file;
+		}
+		if ( "\xFF\xD8" !== substr( $data, 0, 2 ) ) {
+			self::$unchecked_location = self::location_format( $data );
+			return $file;
+		}
+		$clean = self::jpeg_without_gps( $data );
+		if ( $clean !== $data ) {
+			file_put_contents( $path, $clean ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		}
+		return $file;
+	}
+
+	/**
+	 * Image formats that can carry GPS coordinates this plugin does not remove.
+	 *
+	 * @param string $data File bytes.
+	 * @return string Format name, or an empty string for other files.
+	 */
+	private static function location_format( $data ) {
+		if ( "\x89PNG\r\n\x1A\n" === substr( $data, 0, 8 ) ) {
+			return 'PNG';
+		}
+		if ( 'RIFF' === substr( $data, 0, 4 ) && 'WEBP' === substr( $data, 8, 4 ) ) {
+			return 'WebP';
+		}
+		if ( in_array( substr( $data, 0, 4 ), array( "II*\0", "MM\0*" ), true ) ) {
+			return 'TIFF';
+		}
+		if ( 'ftyp' === substr( $data, 4, 4 ) ) {
+			$brand = substr( $data, 8, 4 );
+			if ( in_array( $brand, array( 'avif', 'avis' ), true ) ) {
+				return 'AVIF';
+			}
+			if ( in_array( $brand, array( 'heic', 'heix', 'heim', 'heis', 'hevc', 'hevx', 'mif1', 'msf1' ), true ) ) {
+				return 'HEIC';
+			}
+		}
+		return '';
+	}
+
+	/**
+	 * Tell the agent when an image it uploaded may still hold the place it was taken.
+	 *
+	 * @param \WP_REST_Response $response Attachment response.
+	 * @return \WP_REST_Response
+	 */
+	public static function location_notice( $response ) {
+		if ( '' === self::$unchecked_location || ! Policy::current() || ! $response instanceof \WP_REST_Response ) {
+			return $response;
+		}
+		$data                  = $response->get_data();
+		$data['samcp_privacy'] = sprintf( 'Location data could not be checked in this %s image: it may still hold GPS coordinates of where it was taken. Tell the user before publishing it, or upload a JPEG, whose GPS data is removed.', self::$unchecked_location );
+		$response->set_data( $data );
+		self::$unchecked_location = '';
+		return $response;
+	}
+
+	/**
+	 * JPEG bytes with the EXIF GPS directory emptied and any XMP packet that holds GPS data removed.
+	 *
+	 * @param string $data JPEG bytes.
+	 * @return string
+	 */
+	private static function jpeg_without_gps( $data ) {
+		$out    = substr( $data, 0, 2 );
+		$pos    = 2;
+		$length = strlen( $data );
+		while ( $pos + 4 <= $length && "\xFF" === $data[ $pos ] ) {
+			$type = ord( $data[ $pos + 1 ] );
+			if ( 0xFF === $type ) {
+				// Fill byte.
+				$out .= "\xFF";
+				++$pos;
+				continue;
+			}
+			// Start of scan or end of image: the rest is image data.
+			if ( 0xDA === $type || 0xD9 === $type ) {
+				break;
+			}
+			$size    = unpack( 'n', substr( $data, $pos + 2, 2 ) )[1];
+			$segment = substr( $data, $pos, 2 + $size );
+			if ( 0xE1 === $type ) {
+				$payload = substr( $segment, 4 );
+				if ( 0 === strpos( $payload, "Exif\0\0" ) ) {
+					$segment = substr( $segment, 0, 10 ) . self::tiff_without_gps( substr( $payload, 6 ) );
+				} elseif ( 0 === strpos( $payload, 'http://ns.adobe.com/' ) && false !== stripos( $payload, 'GPS' ) ) {
+					$segment = '';
+				}
+			}
+			$out .= $segment;
+			$pos += 2 + $size;
+		}
+		return $out . substr( $data, $pos );
+	}
+
+	/**
+	 * EXIF (TIFF) block with the GPS directory emptied in place, so every offset stays valid.
+	 *
+	 * @param string $tiff TIFF bytes.
+	 * @return string
+	 */
+	private static function tiff_without_gps( $tiff ) {
+		$length = strlen( $tiff );
+		if ( $length < 8 || ! in_array( substr( $tiff, 0, 2 ), array( 'II', 'MM' ), true ) ) {
+			return $tiff;
+		}
+		$little = 'II' === substr( $tiff, 0, 2 );
+		$u16    = static function ( $at ) use ( &$tiff, $little ) {
+			return unpack( $little ? 'v' : 'n', substr( $tiff, $at, 2 ) )[1];
+		};
+		$u32    = static function ( $at ) use ( &$tiff, $little ) {
+			return unpack( $little ? 'V' : 'N', substr( $tiff, $at, 4 ) )[1];
+		};
+		$ifd0 = $u32( 4 );
+		if ( $ifd0 + 2 > $length ) {
+			return $tiff;
+		}
+		$count = $u16( $ifd0 );
+		$sizes = array( 1 => 1, 2 => 1, 3 => 2, 4 => 4, 5 => 8, 6 => 1, 7 => 1, 8 => 2, 9 => 4, 10 => 8, 11 => 4, 12 => 8 );
+		for ( $i = 0; $i < $count && $ifd0 + 2 + 12 * ( $i + 1 ) <= $length; $i++ ) {
+			$entry = $ifd0 + 2 + 12 * $i;
+			if ( 0x8825 !== $u16( $entry ) ) {
+				continue;
+			}
+			$gps = $u32( $entry + 8 );
+			if ( $gps + 2 > $length ) {
+				break;
+			}
+			$fields = $u16( $gps );
+			$end    = min( $length, $gps + 2 + 12 * $fields + 4 );
+			for ( $j = 0; $j < $fields && $gps + 2 + 12 * ( $j + 1 ) <= $length; $j++ ) {
+				$field = $gps + 2 + 12 * $j;
+				$type  = $u16( $field + 2 );
+				$bytes = ( isset( $sizes[ $type ] ) ? $sizes[ $type ] : 1 ) * $u32( $field + 4 );
+				$value = $u32( $field + 8 );
+				if ( $bytes > 4 && $value + $bytes <= $length ) {
+					$tiff = substr_replace( $tiff, str_repeat( "\0", $bytes ), $value, $bytes );
+				}
+			}
+			// An empty directory: no entries, no next directory.
+			$tiff = substr_replace( $tiff, str_repeat( "\0", $end - $gps ), $gps, $end - $gps );
+			break;
+		}
+		return $tiff;
 	}
 
 	/**

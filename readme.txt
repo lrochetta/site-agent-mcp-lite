@@ -1,9 +1,10 @@
 === Site Agent MCP Lite ===
 Contributors: laurentrochetta
+Donate link: https://www.patreon.com/c/yeswebuild
 Tags: mcp, ai, agents, oauth, seo
 Requires at least: 6.9
 Tested up to: 7.1
-Stable tag: 0.8.1
+Stable tag: 0.9.0
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -51,14 +52,17 @@ Terms: https://developers.google.com/terms and https://policies.google.com/terms
 **Chrome UX Report** (tool crux_query). Sent: a page address or origin, the device type and your Google API key. Sent to chromeuxreport.googleapis.com when an agent asks for real-user metrics.
 Terms: https://developers.google.com/terms . Privacy: https://policies.google.com/privacy
 
-**Google Search Console and Google sign-in** (tools gsc_performance, gsc_inspect_url, gsc_sitemaps, gsc_sites). Only after an administrator enters their own Google Cloud client and connects a Google account in Site Agent > Services. The connection asks Google for read and write access to Search Console, because gsc_sitemaps can submit a sitemap; tools only use the property of this site. Sent: the OAuth client ID and secret and authorization codes or tokens to accounts.google.com and oauth2.googleapis.com; the site address, date ranges, query filters, page addresses and sitemap addresses to www.googleapis.com and searchconsole.googleapis.com when an agent reads search data, inspects a URL or submits a sitemap. Disconnecting revokes the token at Google.
+**Google Search Console and Google sign-in** (tools gsc_performance, gsc_inspect_url, gsc_sitemaps, gsc_sitemaps_list, gsc_sites). Only after an administrator enters their own Google Cloud client and connects a Google account in Site Agent > Services. The connection asks Google for read and write access to Search Console, because gsc_sitemaps can submit a sitemap; tools only use the property of this site. Sent: the OAuth client ID and secret and authorization codes or tokens to accounts.google.com and oauth2.googleapis.com; the site address, date ranges, query filters, page addresses and sitemap addresses to www.googleapis.com and searchconsole.googleapis.com when an agent reads search data, inspects a URL or submits a sitemap. Disconnecting deletes the token on this site and asks Google to revoke it; the screen says so when Google does not confirm.
 Terms: https://developers.google.com/terms and https://policies.google.com/terms . Privacy: https://policies.google.com/privacy
 
-**GTmetrix** (tool gtmetrix_test). Only with a GTmetrix API key saved by an administrator. Sent: the address of a page of this site and the API key, to gtmetrix.com, when an agent starts or reads a test. Each test spends credits of your GTmetrix account.
+**GTmetrix** (tools gtmetrix_test and gtmetrix_result). Only with a GTmetrix API key saved by an administrator. Sent: the address of a page of this site and the API key, to gtmetrix.com, when an agent starts or reads a test. Each test spends credits of your GTmetrix account.
 Terms: https://gtmetrix.com/terms-of-service.html . Privacy: https://gtmetrix.com/privacy-policy.html
 
 **IndexNow** (tool indexnow_submit). Sent: the site's host name, the addresses of changed pages of this site, and an IndexNow key that the plugin creates and serves at the site root, to api.indexnow.org, which shares them with the participating search engines (Bing, Yandex, Naver, Seznam, Yep, Amazon).
 Terms: https://www.indexnow.org/terms . Privacy of Microsoft Bing, which runs api.indexnow.org: https://privacy.microsoft.com/privacystatement
+
+**GitHub** (new version notice, off by default). Only if an administrator ticks "Tell me when a new version of Site Agent MCP Lite is published" in Site Agent > Settings. Sent: one request for the latest release of the public repository of this plugin, to api.github.com, twice a day at most, with WordPress's usual User-Agent (WordPress version and site address). Nothing is downloaded or installed.
+Terms: https://docs.github.com/site-policy/github-terms/github-terms-of-service . Privacy: https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement
 
 **WordPress.org** (tools plugin_describe and extension_manage). Sent: a plugin or theme slug, to api.wordpress.org, when an agent reads a plugin's public documentation or, if you allowed it, installs or updates a plugin or theme; the package is then downloaded from downloads.wordpress.org, as WordPress itself does.
 Privacy: https://wordpress.org/about/privacy/
@@ -109,7 +113,7 @@ Site Agent MCP Full, distributed from https://mcp.wordpress-custom.com/ , adds t
 
 = Does the plugin work on multisite? =
 
-Yes, per site. On a network, only super admins can change options directly or create backups through the plugin.
+Multisite networks are not supported yet. Each site of a network keeps its own connections, settings and data. Deactivating the plugin for the whole network ends the connections of every site, but deleting it removes the data of the main site only. On a network, only super admins can change options directly or create backups through the plugin.
 
 == Screenshots ==
 
@@ -121,6 +125,19 @@ Yes, per site. On a network, only super admins can change options directly or cr
 6. Site Agent > Activity: every tool call, by user and application.
 
 == Changelog ==
+
+= 0.9.0 =
+* About 80 fixes from an independent audit of 0.8.1, covered by new checks in the test bench.
+* Consent screen: read only stays preselected; the other levels you allow remain one click away.
+* Revoking a connection can no longer be outrun by a refresh made at the same moment.
+* A read-only connection can no longer start a paid GTmetrix test: starting a test needs write access, and reading its result is a separate tool.
+* Undo no longer overwrites a change a person made afterwards: such items are skipped and reported. Two undos at the same moment apply once.
+* New version notice, off by default: tick it in Site Agent > Settings to be told when a new Lite version is published on GitHub. The check runs in the background, twice a day at most.
+* Search Console and PageSpeed can use the Google connection of Site Kit by Google when it is set up.
+* Tool calls are limited per connection, GPS data is removed from JPEG images agents upload, and backups refuse a folder that visitors can open or flag a copy that could not be read in full.
+* Admin screens read through the site's own address now check its TLS certificate. A site whose own address uses a self-signed certificate can turn the check off with the samcp_loopback_sslverify filter: add_filter( 'samcp_loopback_sslverify', '__return_false' ).
+* Multisite is not supported yet: this readme no longer says it is. Deactivating the plugin for a whole network now ends the connections of every site.
+* A Patreon link, in the plugin credits and the readme, for those who want to support the project.
 
 = 0.8.1 =
 * Security fixes from an independent deep review of 0.8.0: a token now works on the MCP route only, whatever route a request names; the agent rules start as soon as the token is read; an agent can never change an account's password, e-mail or login; every option and cache of Site Agent MCP is out of agents' reach whatever the spelling of its name; the schedule (cron) is out of reach without server-level access.

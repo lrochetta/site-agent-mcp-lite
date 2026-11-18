@@ -27,6 +27,12 @@ class Tools {
 	/** Values that are secrets whatever their name: private keys, JWTs and well-known API key formats. */
 	const SECRET_VALUE = '/(-----BEGIN [A-Z ]*PRIVATE KEY-----|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.|\b(sk|rk)_(live|test)_[A-Za-z0-9]{10,}|\bAIza[0-9A-Za-z_-]{30,}|\bgh[pousr]_[A-Za-z0-9]{30,}|\bxox[abprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|\bglpat-[A-Za-z0-9_-]{20})/';
 
+	/** Most routes rest_routes returns in one call; offset reads the rest. */
+	const ROUTES_LIMIT = 300;
+
+	/** WP-CLI commands without subcommands: the word after them is already a value. */
+	const CLI_SINGLE_COMMANDS = array( 'eval', 'eval-file', 'search-replace', 'shell', 'import', 'export', 'find', 'help' );
+
 	/** Options the Lite edition never sets directly: they decide which code runs. */
 	const LITE_PROTECTED_OPTIONS = array( 'active_plugins', 'active_sitewide_plugins', 'recently_activated', 'uninstall_plugins', 'template', 'stylesheet', 'cron' );
 
@@ -65,9 +71,10 @@ class Tools {
 	 * @param string $handler     Callable.
 	 * @param string $scope       Required scope.
 	 * @param string $capability  Required capability.
+	 * @param bool   $open_world  Whether the tool talks to a service outside this site.
 	 * @return array
 	 */
-	private static function tool( $title, $description, array $schema, $mode, $handler, $scope = OAuth::SCOPE_FULL, $capability = 'read' ) {
+	private static function tool( $title, $description, array $schema, $mode, $handler, $scope = OAuth::SCOPE_FULL, $capability = 'read', $open_world = false ) {
 		return array(
 			'title'       => $title,
 			'description' => $description,
@@ -77,7 +84,7 @@ class Tools {
 				'readOnlyHint'    => 'read' === $mode,
 				'destructiveHint' => 'destructive' === $mode,
 				'idempotentHint'  => 'read' === $mode,
-				'openWorldHint'   => false,
+				'openWorldHint'   => (bool) $open_world,
 			),
 			'handler'     => $handler,
 			'scope'       => $scope,
@@ -126,8 +133,8 @@ class Tools {
 			'plugin_describe'   => self::tool( 'Describe a plugin', 'Everything known about how to use an installed plugin: REST routes, abilities, readme, AJAX actions, settings, admin screens, CLI commands and option names. Use it before working with an unfamiliar plugin.', self::schema( array( 'slug' => $str + array( 'description' => 'Plugin slug from extensions_list.' ), 'include_wordpress_org' => $bool + array( 'description' => 'Also read its public wordpress.org documentation.' ) ), array( 'slug' ) ), 'read', $c . 'plugin_describe', OAuth::SCOPE_FULL, 'activate_plugins' ),
 			'extension_manage'  => self::tool( 'Manage plugins, themes and core', 'Install, update, activate, deactivate or delete a plugin or theme, or update WordPress core. ' . $manage_install, self::schema( $manage_properties, array( 'type', 'action' ) ), 'destructive', $c . 'extension_manage' ),
 
-			'rest_routes'       => self::tool( 'Discover REST routes', 'REST routes of WordPress and every active plugin. Without filters, returns the namespaces. Filter by namespace or search text to get routes and methods.', self::schema( array( 'namespace' => $str, 'search' => $str, 'include_args' => $bool + array( 'description' => 'Include each route\'s parameters.' ) ) ), 'read', $c . 'rest_routes' ),
-			'rest_call'         => self::tool( 'Call a REST route', 'Call any REST route, as this user, on WordPress or any plugin. Example: GET /wp/v2/posts. Templates and global styles are at /wp/v2/templates and /wp/v2/global-styles. To upload media, POST to /wp/v2/media with raw_body_base64, content_type and filename.', self::schema( array( 'method' => $str + array( 'enum' => array( 'GET', 'POST', 'PUT', 'PATCH', 'DELETE' ) ), 'route' => $str + array( 'description' => 'Route path such as /wp/v2/posts/12.' ), 'query' => $obj, 'body' => $obj + array( 'description' => 'JSON body.' ), 'raw_body_base64' => $str, 'content_type' => $str, 'filename' => $str ), array( 'method', 'route' ) ), 'destructive', $c . 'rest_call' ),
+			'rest_routes'       => self::tool( 'Discover REST routes', 'REST routes of WordPress and every active plugin. Without filters, returns the namespaces. Filter by namespace or search text to get routes and methods, at most 300 per call: when truncated is true, call again with next_offset.', self::schema( array( 'namespace' => $str, 'search' => $str, 'include_args' => $bool + array( 'description' => 'Include each route\'s parameters.' ), 'offset' => $int + array( 'description' => 'Matching routes to skip, from next_offset.' ), 'limit' => $int + array( 'description' => 'Routes to return, 300 at most.' ) ) ), 'read', $c . 'rest_routes' ),
+			'rest_call'         => self::tool( 'Call a REST route', 'Call any REST route, as this user, on WordPress or any plugin. Example: GET /wp/v2/posts. Templates and global styles are at /wp/v2/templates and /wp/v2/global-styles. To upload media, POST to /wp/v2/media with raw_body_base64, content_type and filename. A write to a post that someone else has open in the editor is refused unless force is true.', self::schema( array( 'method' => $str + array( 'enum' => array( 'GET', 'POST', 'PUT', 'PATCH', 'DELETE' ) ), 'route' => $str + array( 'description' => 'Route path such as /wp/v2/posts/12.' ), 'query' => $obj, 'body' => $obj + array( 'description' => 'JSON body.' ), 'raw_body_base64' => $str, 'content_type' => $str, 'filename' => $str, 'force' => $bool + array( 'description' => 'Write even though another person has the post open in the editor. Ask the user first.' ) ), array( 'method', 'route' ) ), 'destructive', $c . 'rest_call' ),
 
 			'abilities_list'    => self::tool( 'List abilities', 'WordPress abilities registered by core and plugins, with their input schema. Abilities are the most reliable way to use a plugin when one exists.', self::schema( array( 'search' => $str ) ), 'read', $c . 'abilities_list' ),
 			'ability_run'       => self::tool( 'Run an ability', 'Run a WordPress ability. Its own permission check applies.', self::schema( array( 'name' => $str, 'input' => $obj ), array( 'name' ) ), 'destructive', $c . 'ability_run' ),
@@ -138,7 +145,7 @@ class Tools {
 
 			'admin_menu'        => self::tool( 'List admin screens', 'Admin menu entries visible to this user, including plugin screens.', self::schema(), 'read', $c . 'admin_menu' ),
 			'admin_page_read'   => self::tool( 'Read an admin screen', 'Read an admin screen as structured data: forms with labels, help and values, notices, text, and the REST namespaces and AJAX actions it uses. Use it for plugins with no REST route, ability or documented option.', self::schema( array( 'page' => $str + array( 'description' => 'Admin path such as admin.php?page=wpseo_dashboard.' ) ), array( 'page' ) ), 'read', $c . 'admin_page_read' ),
-			'admin_form_submit' => self::tool( 'Submit an admin form', 'Fill and send a form from an admin screen, starting from its current values and a fresh nonce. dry_run defaults to true and only shows the changes. Reports which options changed and returns a change_id for change_undo.', self::schema( array( 'page' => $str, 'form_index' => $int, 'values' => $obj + array( 'description' => 'Field name to new value. An array sets a multi-value field; null removes the field.' ), 'dry_run' => $bool, 'allow_unknown_fields' => $bool, 'submit' => $str + array( 'description' => 'Name of the submit button, if several.' ) ), array( 'page', 'form_index', 'values' ) ), 'destructive', $c . 'admin_form_submit' ),
+			'admin_form_submit' => self::tool( 'Submit an admin form', 'Fill and send a form from an admin screen, starting from its current values and a fresh nonce. dry_run defaults to true and only shows the changes. Reports which options changed and returns a change_id for change_undo.', self::schema( array( 'page' => $str, 'form_index' => $int, 'values' => $obj + array( 'description' => 'Field name to new value. An array sets a multi-value field; null removes the field.' ), 'dry_run' => $bool, 'allow_unknown_fields' => $bool, 'submit' => $str + array( 'description' => 'Submit button to press, if several: its name, or name=value when buttons share a name.' ) ), array( 'page', 'form_index', 'values' ) ), 'destructive', $c . 'admin_form_submit' ),
 
 			'page_fetch'        => self::tool( 'Inspect a public page', 'Fetch a page of this site and analyse it: status, response time, cache headers, title, meta tags, canonical, robots, Open Graph, hreflang, headings, JSON-LD, images without alt text and HTML. Use it for SEO, GEO, performance checks and to verify a change. It does not render JavaScript or produce screenshots.', self::schema( array( 'url' => $str + array( 'description' => 'URL or path on this site. Works for /robots.txt and /llms.txt.' ), 'as_user' => $bool + array( 'description' => 'Fetch logged in as this user. Default is anonymous, which is what visitors and caches see.' ), 'html_chars' => $int ), array( 'url' ) ), 'read', $c . 'page_fetch' ),
 			'cache_flush'       => self::tool( 'Flush caches', 'Flush the object cache and the page cache of common cache plugins. Reports what was flushed.', self::schema(), 'write', $c . 'cache_flush', OAuth::SCOPE_FULL, 'manage_options' ),
@@ -163,11 +170,12 @@ class Tools {
 	 * @param string $mode        Mode.
 	 * @param string $handler     Seo_Tools method.
 	 * @param string $capability  Capability.
+	 * @param bool   $open_world  Whether the tool talks to a service outside this site.
 	 * @return array
 	 */
-	public static function seo_tool( $title, $description, array $properties, array $required, $mode, $handler, $capability ) {
+	public static function seo_tool( $title, $description, array $properties, array $required, $mode, $handler, $capability, $open_world = false ) {
 		$callable = false === strpos( $handler, '::' ) ? __NAMESPACE__ . '\\Seo_Tools::' . $handler : $handler;
-		return self::tool( $title, $description, self::schema( $properties, $required ), $mode, $callable, OAuth::SCOPE_FULL, $capability );
+		return self::tool( $title, $description, self::schema( $properties, $required ), $mode, $callable, OAuth::SCOPE_FULL, $capability, $open_world );
 	}
 
 
@@ -214,6 +222,22 @@ class Tools {
 	 */
 	public static function token_has_power( array $token ) {
 		return in_array( OAuth::SCOPE_POWER, explode( ' ', $token['scope'] ), true );
+	}
+
+	/**
+	 * Whether a token has server-level access right now: the power scope, the site switch on,
+	 * and the full level today. The scope alone is not enough, since the person or the
+	 * settings may have lowered the connection since it was approved.
+	 *
+	 * @param array $token Token.
+	 * @return bool
+	 */
+	public static function has_server_access( array $token ) {
+		if ( ! $token || ! isset( $token['scope'], $token['user_id'] ) ) {
+			return false;
+		}
+		$context = Policy::context_for( $token + array( 'family' => '' ) );
+		return ! empty( $context['power'] );
 	}
 
 	/**
@@ -339,11 +363,106 @@ class Tools {
 	 * @return string
 	 */
 	private static function encode( $output ) {
-		$text = wp_json_encode( $output, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR );
+		$text = self::json( $output );
+		if ( strlen( $text ) <= self::OUTPUT_LIMIT ) {
+			return $text;
+		}
+		// The result stays one valid JSON document: the bulky parts are cut before encoding, while
+		// small fields such as status, change_id and options_changed are kept whole.
+		$note = 'Truncated to fit ' . self::OUTPUT_LIMIT . ' bytes: part of this result is missing. Read it again asking for less: use filters, _fields, per_page, a smaller limit or length, or a smaller range.';
+		if ( ! is_array( $output ) || ( $output && array_values( $output ) === $output ) ) {
+			$output = array( 'result' => $output );
+		}
+		// A tool's own paging describes the whole answer, not the part kept here: following it would skip what was cut.
+		unset( $output['next_offset'], $output['hint'] );
+		// The encoder's flag comes first, so it wins over a tool's own "truncated": false.
+		$flag   = array(
+			'truncated'      => true,
+			'truncated_note' => $note,
+		);
+		$fitted = self::fit( $output, self::OUTPUT_LIMIT - 600 );
+		$fitted = is_array( $fitted ) ? $fitted : array();
+		$text   = self::json( $flag + $fitted );
 		if ( strlen( $text ) > self::OUTPUT_LIMIT ) {
-			$text = Store::cut( $text, self::OUTPUT_LIMIT ) . "\n[Truncated at " . self::OUTPUT_LIMIT . ' bytes. Ask for less: use filters, _fields, per_page or a smaller range.]';
+			// Last resort: the scalar fields only.
+			$text = self::json( $flag + array_filter( $output, 'is_scalar' ) );
 		}
 		return $text;
+	}
+
+	/**
+	 * JSON text of a value, as sent to clients.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 */
+	private static function json( $value ) {
+		return (string) wp_json_encode( $value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR );
+	}
+
+	/**
+	 * Shrink a value until its JSON fits a byte budget: long strings are cut, lists lose their
+	 * last items, and objects shrink their largest members first, so small fields survive.
+	 *
+	 * @param mixed $value Value.
+	 * @param int   $room  Bytes of JSON the value may take.
+	 * @return mixed
+	 */
+	private static function fit( $value, $room ) {
+		if ( is_object( $value ) ) {
+			$value = get_object_vars( $value );
+		}
+		$size = strlen( self::json( $value ) );
+		if ( $size <= $room ) {
+			return $value;
+		}
+		if ( is_string( $value ) ) {
+			// Escaping makes JSON longer than the text: scale the cut, the caller checks again.
+			return Store::cut( $value, max( 0, (int) floor( strlen( $value ) * ( $room - 2 ) / $size ) ) );
+		}
+		if ( ! is_array( $value ) ) {
+			return null;
+		}
+		if ( array_values( $value ) === $value ) {
+			$kept = array();
+			$used = 2;
+			foreach ( $value as $item ) {
+				$item_size = strlen( self::json( $item ) ) + 1;
+				if ( $used + $item_size > $room ) {
+					if ( ! $kept && $room - $used > 2 ) {
+						$kept[] = self::fit( $item, $room - $used - 1 );
+					}
+					break;
+				}
+				$kept[] = $item;
+				$used  += $item_size;
+			}
+			return $kept;
+		}
+		for ( $round = 0; $round < 50 && $size > $room; $round++ ) {
+			$largest      = null;
+			$largest_size = 0;
+			foreach ( $value as $key => $item ) {
+				if ( ! is_string( $item ) && ! is_array( $item ) && ! is_object( $item ) ) {
+					continue;
+				}
+				$item_size = strlen( self::json( $item ) );
+				if ( $item_size > $largest_size ) {
+					$largest      = $key;
+					$largest_size = $item_size;
+				}
+			}
+			if ( null === $largest || $largest_size <= 2 ) {
+				break;
+			}
+			$value[ $largest ] = self::fit( $value[ $largest ], max( 0, $largest_size - ( $size - $room ) ) );
+			$new_size          = strlen( self::json( $value ) );
+			if ( $new_size >= $size ) {
+				break;
+			}
+			$size = $new_size;
+		}
+		return $value;
 	}
 
 	/**
@@ -357,13 +476,7 @@ class Tools {
 		$parts = array();
 		foreach ( $arguments as $key => $value ) {
 			if ( 'args' === $key && is_array( $value ) ) {
-				// WP-CLI: the command stays readable, values after "=" are masked.
-				$words = array();
-				foreach ( $value as $word ) {
-					$word    = is_scalar( $word ) ? (string) $word : '';
-					$words[] = false !== strpos( $word, '=' ) ? substr( $word, 0, strpos( $word, '=' ) + 1 ) . '…' : $word;
-				}
-				$parts[] = 'args=' . Store::cut( implode( ' ', $words ), 200 );
+				$parts[] = 'args=' . Store::cut( self::summarize_cli( $value ), 200 );
 			} elseif ( in_array( $key, array( 'sql', 'code', 'args' ), true ) ) {
 				$text = is_string( $value ) ? $value : (string) wp_json_encode( $value );
 				// Quoted literals can hold secrets: mask them and keep the statement's shape for the audit log.
@@ -380,6 +493,36 @@ class Tools {
 			}
 		}
 		return implode( ' ', $parts );
+	}
+
+	/**
+	 * WP-CLI arguments for the audit log: the command and the names of its options, never
+	 * a value. Positional values (a login, an e-mail, a password) and option values are masked.
+	 *
+	 * @param array $words Arguments, without the wp prefix.
+	 * @return string
+	 */
+	private static function summarize_cli( array $words ) {
+		$out     = array();
+		$command = 0;
+		foreach ( array_values( $words ) as $word ) {
+			$word = is_scalar( $word ) ? (string) $word : '';
+			if ( 0 === strpos( $word, '-' ) ) {
+				// An option: its name stays, its value does not.
+				$equals = strpos( $word, '=' );
+				$name   = false === $equals ? $word : substr( $word, 0, $equals );
+				$out[]  = preg_match( '/^--?[A-Za-z0-9_-]+$/', $name ) ? $name . ( false === $equals ? '' : '=…' ) : '…';
+			} elseif ( $command < 2 && preg_match( '/^[a-z][a-z0-9_-]*$/', $word ) ) {
+				// The command and its subcommand, as in "user create" or "option get". A command
+				// without subcommands takes values next ("search-replace old new"): they are masked.
+				$out[]   = $word;
+				$command = 0 === $command && in_array( $word, self::CLI_SINGLE_COMMANDS, true ) ? 2 : $command + 1;
+			} else {
+				$out[]   = '…';
+				$command = 2;
+			}
+		}
+		return implode( ' ', $out );
 	}
 
 	/**
@@ -447,10 +590,12 @@ class Tools {
 			// Effective capabilities: map_meta_cap removes e.g. edit_files under DISALLOW_FILE_EDIT.
 			'capabilities' => array_values( array_filter( array_keys( array_filter( $user->allcaps ) ), 'current_user_can' ) ),
 		);
+		// The same decision as tools/list: level, site switch and the edit_files right (DISALLOW_FILE_EDIT removes it).
+		$registry     = self::registry();
 		$connection   = array(
 			'client'             => $token['client_name'],
 			'scope'              => $token['scope'],
-			'server_level_tools' => OAuth::power_tools_enabled() && self::token_has_power( $token ),
+			'server_level_tools' => isset( $registry['php_run'] ) && self::allowed( 'php_run', $registry['php_run'], $token ),
 			'access_level'       => Policy::token_level( $token ),
 			// ok, missing or unknown: whether this server passes the Authorization header to WordPress.
 			'authorization_header' => Header_Check::cached(),
@@ -767,9 +912,22 @@ class Tools {
 				'hint'       => 'Call again with a namespace or search to see routes.',
 			);
 		}
-		$routes = array();
+		$offset  = isset( $args['offset'] ) ? max( 0, (int) $args['offset'] ) : 0;
+		$limit   = isset( $args['limit'] ) ? min( self::ROUTES_LIMIT, max( 1, (int) $args['limit'] ) ) : self::ROUTES_LIMIT;
+		$routes  = array();
+		$matched = 0;
+		// The list stops before the answer outgrows what clients accept, so next_offset
+		// points at the first route really left out, never past routes cut on the way out.
+		$budget = self::OUTPUT_LIMIT - 5000;
+		$used   = 200;
+		$full   = false;
 		foreach ( $server->get_routes( $namespace ) as $route => $handlers ) {
 			if ( '' !== $search && false === strpos( strtolower( $route ), $search ) ) {
+				continue;
+			}
+			// Every match is counted, so the agent knows how many it has not seen yet.
+			++$matched;
+			if ( $matched <= $offset || $full || count( $routes ) >= $limit ) {
 				continue;
 			}
 			$entry = array(
@@ -785,12 +943,30 @@ class Tools {
 				}
 			}
 			$entry['methods'] = array_values( array_unique( $entry['methods'] ) );
-			$routes[]         = $entry;
-			if ( count( $routes ) >= 300 ) {
-				break;
+			$size             = strlen( self::json( $entry ) ) + 1;
+			if ( $routes && $used + $size > $budget ) {
+				$full = true;
+				continue;
 			}
+			if ( ! $routes && $used + $size > $budget && isset( $entry['args'] ) ) {
+				// A single route too large to send whole: its methods come without the parameters.
+				unset( $entry['args'] );
+				$entry['args_omitted'] = true;
+				$size                  = strlen( self::json( $entry ) ) + 1;
+			}
+			$routes[] = $entry;
+			$used    += $size;
 		}
-		return array( 'routes' => $routes );
+		$result = array(
+			'routes'    => $routes,
+			'total'     => $matched,
+			'truncated' => $offset + count( $routes ) < $matched,
+		);
+		if ( $result['truncated'] ) {
+			$result['next_offset'] = $offset + count( $routes );
+			$result['hint']        = 'More routes match. Call again with offset ' . $result['next_offset'] . ', or narrow with namespace or search.';
+		}
+		return $result;
 	}
 
 	/**
@@ -804,6 +980,9 @@ class Tools {
 		$route  = '/' . ltrim( self::required( $args, 'route' ), '/' );
 		if ( 'GET' !== $method && $token && 'read' === Policy::token_level( $token ) ) {
 			throw new Tool_Error( 'This connection is read-only: only GET requests are allowed.' );
+		}
+		if ( 'GET' !== $method ) {
+			self::assert_route_not_locked( $route, $args );
 		}
 
 		$request = new \WP_REST_Request( $method, $route );
@@ -839,10 +1018,11 @@ class Tools {
 		$status  = $response->get_status();
 		$headers = array_intersect_key( $response->get_headers(), array_flip( array( 'X-WP-Total', 'X-WP-TotalPages', 'Location', 'Allow' ) ) );
 		$result  = array(
-			'_is_error' => $status >= 400,
-			'status'    => $status,
-			'headers'   => $headers,
-			'data'      => self::redact( $data ),
+			'_is_error'     => $status >= 400,
+			'content_trust' => 'untrusted_site_content',
+			'status'        => $status,
+			'headers'       => $headers,
+			'data'          => self::redact( $data ),
 		);
 		if ( $change['names'] ) {
 			$result['options_changed'] = $change['names'];
@@ -853,6 +1033,30 @@ class Tools {
 			$result['warning'] = $warning;
 		}
 		return $result;
+	}
+
+	/**
+	 * Refuse a REST write to a post that another person has open in the editor, unless forced.
+	 * Only routes of the form /wp/v2/<rest base>/<id> whose base is the post's own type count.
+	 *
+	 * @param string $route REST route.
+	 * @param array  $args  Tool arguments, where force may be true.
+	 * @throws Tool_Error When the post is locked by someone else.
+	 */
+	private static function assert_route_not_locked( $route, array $args ) {
+		if ( ! preg_match( '#^/wp/v2/([a-z0-9_-]+)/(\d+)(?:/|$)#', (string) strtok( $route, '?' ), $match ) ) {
+			return;
+		}
+		$post = get_post( (int) $match[2] );
+		if ( ! $post ) {
+			return;
+		}
+		$type = get_post_type_object( $post->post_type );
+		$base = $type && ! empty( $type->rest_base ) ? $type->rest_base : $post->post_type;
+		if ( $base !== $match[1] ) {
+			return;
+		}
+		Seo_Tools::assert_not_locked( (int) $post->ID, $args );
 	}
 
 	/**
@@ -952,7 +1156,10 @@ class Tools {
 		if ( is_wp_error( $result ) ) {
 			throw new Tool_Error( esc_html( $result->get_error_message() ) );
 		}
-		$output = array( 'result' => self::redact( $result ) );
+		$output = array(
+			'content_trust' => 'untrusted_site_content',
+			'result'        => self::redact( $result ),
+		);
 		if ( $change['names'] ) {
 			$output['options_changed'] = $change['names'];
 			$output['change_id']       = $change['id'];
@@ -994,8 +1201,9 @@ class Tools {
 		if ( $reveal && 'full' !== SAMCP_EDITION ) {
 			throw new Tool_Error( 'reveal_secrets is not available in this edition: secret values stay hidden.' );
 		}
-		if ( $reveal && ! ( OAuth::power_tools_enabled() && self::token_has_power( $token ) ) ) {
-			throw new Tool_Error( 'reveal_secrets needs server-level access. Reconnect and tick that option on the consent screen.' );
+		// The access the connection has today, not the scope it was approved with: a lowered account loses it at once.
+		if ( $reveal && ! self::has_server_access( $token ) ) {
+			throw new Tool_Error( 'reveal_secrets needs server-level access with the full level. Ask the user to reconnect with full access and tick that option on the consent screen.' );
 		}
 		$values = array();
 		foreach ( (array) ( isset( $args['names'] ) ? $args['names'] : array() ) as $name ) {
@@ -1007,7 +1215,8 @@ class Tools {
 				continue;
 			}
 			if ( ! $reveal ) {
-				$value = self::is_secret_name( $name ) && ! is_array( $value ) && ! is_object( $value ) && null !== $value ? '[hidden]' : self::redact( $value );
+				// A secret-looking name hides the whole value, lists and objects included: their parts inherit the name.
+				$value = self::is_secret_name( $name ) && null !== $value && array() !== $value ? '[hidden]' : self::redact( $value );
 			}
 			$values[ $name ] = $value;
 		}
@@ -1051,18 +1260,81 @@ class Tools {
 		$snapshot = Journal::snapshot_options();
 		$results  = array();
 		$changes  = $args['changes'];
-		Policy::agent_write(
-			static function () use ( $changes, &$results ) {
-				foreach ( $changes as $name => $value ) {
-					$results[ $name ] = update_option( (string) $name, $value );
+		$label    = implode( ', ', array_keys( $changes ) );
+		$change   = null;
+		try {
+			Policy::agent_write(
+				static function () use ( $changes, &$results ) {
+					foreach ( $changes as $name => $value ) {
+						$results[ $name ] = update_option( (string) $name, $value );
+					}
 				}
+			);
+		} catch ( Tool_Error $e ) {
+			// A refusal can stop the batch halfway: what was already written stays undoable, and the agent is told.
+			$change = self::record_named_options( $snapshot, array_keys( $changes ), $label );
+			if ( $change['names'] ) {
+				throw new Tool_Error( esc_html( $e->getMessage() ) . ' Options already written before this refusal: ' . esc_html( implode( ', ', $change['names'] ) ) . ( $change['id'] ? '. Undo them with change_undo, change_id ' . (int) $change['id'] . '.' : '.' ) );
 			}
-		);
-		$change = Journal::record_option_diff( $snapshot, 'options_update', implode( ', ', array_keys( $args['changes'] ) ) );
+			throw $e;
+		} finally {
+			// Any other failure still journals the writes made before it.
+			if ( null === $change ) {
+				$change = self::record_named_options( $snapshot, array_keys( $changes ), $label );
+			}
+		}
 		return array(
 			'updated'         => $results,
 			'options_changed' => $change['names'],
 			'change_id'       => $change['id'],
+		);
+	}
+
+	/**
+	 * Journal the options a direct write named, and only those: another option changed
+	 * meanwhile, by a person, a scheduled task or a hook, is not the agent's change.
+	 * Names compare as the database does (case, accents, trailing spaces).
+	 *
+	 * @param array    $before Snapshot taken before the write.
+	 * @param string[] $names  Option names the agent asked to set.
+	 * @param string   $label  Journal label.
+	 * @return array id and names.
+	 */
+	private static function record_named_options( array $before, array $names, $label ) {
+		$wanted = array();
+		foreach ( $names as $name ) {
+			$wanted[ Policy::normalise_option( trim( (string) $name ) ) ] = true;
+		}
+		$after = Journal::snapshot_options();
+		$state = array();
+		foreach ( array_keys( $before + $after ) as $name ) {
+			if ( ! isset( $wanted[ Policy::normalise_option( trim( (string) $name ) ) ] ) ) {
+				continue;
+			}
+			$had = array_key_exists( $name, $before );
+			$has = array_key_exists( $name, $after );
+			if ( ! $had ) {
+				$state[ $name ] = array(
+					'exists' => false,
+					'now'    => $after[ $name ],
+				);
+			} elseif ( ! $has || $before[ $name ] !== $after[ $name ] ) {
+				$state[ $name ] = array(
+					'exists' => true,
+					'raw'    => $before[ $name ],
+					'now'    => $has ? $after[ $name ] : null,
+				);
+			}
+		}
+		if ( ! $state ) {
+			return array(
+				'id'    => null,
+				'names' => array(),
+			);
+		}
+		return array(
+			'id'    => Journal::record( 'options_update', $label, array( 'options' => $state ) ),
+			'names' => array_map( 'strval', array_keys( $state ) ),
 		);
 	}
 
@@ -1334,7 +1606,7 @@ class Tools {
 	 * @return array
 	 */
 	public static function change_undo( array $args, array $token ) {
-		$has_power = OAuth::power_tools_enabled() && self::token_has_power( $token );
+		$has_power = self::has_server_access( $token );
 		return array( 'restored' => Journal::undo( (int) ( isset( $args['change_id'] ) ? $args['change_id'] : 0 ), $has_power ) );
 	}
 }

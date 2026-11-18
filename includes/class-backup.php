@@ -26,6 +26,11 @@ class Backup {
 	const ROW_BYTES  = 1048576;
 	const CHUNK      = 1048576;
 	const HASH_LIMIT = 20971520;
+	/** Harmless file kept in the backup folder, fetched over HTTP to prove visitors are refused. */
+	const WITNESS    = 'samcp-witness.txt';
+	const EXPOSURE   = 'samcp_backup_exposure';
+	/** What a backup of a live site promises about its database, written in each manifest. */
+	const CONSISTENCY = 'Each table is read in pages, in primary key order: a row written during the backup is in it or not, never twice, and no row that existed throughout is missed. Tables without a primary key are read by position and can miss or repeat rows changed meanwhile (listed in the warnings). The tables are not one snapshot: rows changed in two tables during the backup may not match.';
 	/** Folders never archived: caches and other backup plugins' archives. */
 	const EXCLUDED = array( 'wp-content/cache', 'wp-content/upgrade', 'wp-content/updraft', 'wp-content/ai1wm-backups', 'wp-content/backups-dup-lite', 'wp-content/backups-dup-pro', 'wp-content/wpvivid_backup', 'wp-content/backup-db', 'wp-content/uploads/backwpup', 'wp-content/et-cache' );
 
@@ -122,6 +127,13 @@ class Backup {
 				/* translators: %s: number of database tables. */
 				sprintf( _n( '%s table', '%s tables', (int) $report['tables'], 'site-agent-mcp-lite' ), number_format_i18n( (int) $report['tables'] ) )
 			);
+			if ( ! empty( $report['degraded'] ) ) {
+				$detail .= ' ' . sprintf(
+					/* translators: %s: number of files. */
+					_n( 'But %s file changed while it was saved, so its copy is incomplete.', 'But %s files changed while they were saved, so their copies are incomplete.', (int) $report['incomplete_count'], 'site-agent-mcp-lite' ),
+					number_format_i18n( (int) $report['incomplete_count'] )
+				);
+			}
 		}
 		self::admin_back( $report['ok'] ? 'backup_verified' : 'backup_failed', $detail );
 	}
@@ -169,10 +181,12 @@ class Backup {
 				$running = $backup;
 			}
 		}
-		try {
-			$web = self::web_path( self::storage() );
-		} catch ( Tool_Error $e ) {
-			$web = null;
+		$problem  = self::storage_problem();
+		$web      = null;
+		$exposure = 'outside';
+		if ( null === $problem ) {
+			$web      = self::web_path( self::storage() );
+			$exposure = self::exposure( self::storage() );
 		}
 		$post = admin_url( 'admin-post.php' );
 		?>
@@ -185,10 +199,28 @@ class Backup {
 					<a href="<?php echo esc_url( SAMCP_FULL_URL ); ?>" target="_blank" rel="noopener"><?php esc_html_e( 'About Site Agent MCP Full', 'site-agent-mcp-lite' ); ?><span class="screen-reader-text"> <?php esc_html_e( '(opens in a new tab)', 'site-agent-mcp-lite' ); ?></span></a>
 				</p>
 			<?php endif; ?>
-			<?php if ( null !== $web ) : ?>
-				<p class="description"><?php echo esc_html( sprintf( /* translators: %s: folder. */ __( 'Backups are kept in /%s, which Apache, LiteSpeed and IIS refuse to serve. On Nginx, block that folder or download each backup and delete it here.', 'site-agent-mcp-lite' ), $web ) ); ?></p>
+			<?php if ( null !== $problem ) : ?>
+				<div class="notice notice-error inline" data-samcp-storage-problem>
+					<p><strong><?php esc_html_e( 'The backup folder cannot be used right now.', 'site-agent-mcp-lite' ); ?></strong> <?php esc_html_e( 'Backups made before are not lost: they cannot be listed while the folder is unavailable. Ask your host to give the web server write access to the backup folder again, then reload this page.', 'site-agent-mcp-lite' ); ?></p>
+					<p class="samcp-break"><?php echo esc_html( $problem ); ?></p>
+					<?php if ( '' !== (string) get_option( self::DIR_OPTION, '' ) ) : ?>
+						<p><?php esc_html_e( 'Backup folder:', 'site-agent-mcp-lite' ); ?> <code class="samcp-break"><?php echo esc_html( (string) get_option( self::DIR_OPTION, '' ) ); ?></code></p>
+					<?php endif; ?>
+				</div>
+			<?php elseif ( null !== $web && 'served' === $exposure ) : ?>
+				<div class="notice notice-error inline" data-samcp-storage="<?php echo esc_attr( $web ); ?>">
+					<p><?php echo esc_html( sprintf( /* translators: %s: folder. */ __( 'Backups are kept in /%s, and this web server lets anyone download files from it. No new backup starts until the folder is blocked: ask your host to block it, then reload this page. Download the backups already there and delete them here.', 'site-agent-mcp-lite' ), $web ) ); ?></p>
+				</div>
+			<?php elseif ( null !== $web && 'unknown' === $exposure ) : ?>
+				<div class="notice notice-warning inline" data-samcp-storage="<?php echo esc_attr( $web ); ?>" data-samcp-storage-unproven>
+					<p><?php echo esc_html( sprintf( /* translators: %s: folder. */ __( 'Backups are kept in /%s, with rules that Apache, LiteSpeed and IIS follow. The site could not fetch a test file from that folder over its own address, so it cannot prove that visitors are refused, and no new backup starts. Ask your host to let the site make HTTP requests to its own address, or to let PHP write in the folder above WordPress, then reload this page.', 'site-agent-mcp-lite' ), $web ) ); ?></p>
+				</div>
+			<?php elseif ( null !== $web ) : ?>
+				<p class="description" data-samcp-storage="<?php echo esc_attr( $web ); ?>"><?php echo esc_html( sprintf( /* translators: %s: folder. */ __( 'Backups are kept in /%s. A test file in that folder is refused to visitors.', 'site-agent-mcp-lite' ), $web ) ); ?></p>
 			<?php endif; ?>
-			<?php if ( $running ) : ?>
+			<?php if ( null !== $problem ) : ?>
+				<?php // Nothing to start or list while the folder is unavailable. ?>
+			<?php elseif ( $running ) : ?>
 				<div id="samcp-backup-progress" class="samcp-progress">
 					<p class="samcp-progress-text"><span class="dashicons dashicons-update samcp-spin" aria-hidden="true"></span> <span id="samcp-progress-text" data-samcp-progress-text><?php esc_html_e( 'Backup in progress', 'site-agent-mcp-lite' ); ?></span></p>
 					<progress max="100" aria-labelledby="samcp-progress-text"></progress>
@@ -210,7 +242,9 @@ class Backup {
 
 		<section class="samcp-panel" aria-labelledby="samcp-backup-list-title">
 			<h2 id="samcp-backup-list-title"><?php esc_html_e( 'Backups on this server', 'site-agent-mcp-lite' ); ?></h2>
-			<?php if ( ! $backups ) : ?>
+			<?php if ( null !== $problem ) : ?>
+				<p><?php esc_html_e( 'The list is unavailable until the backup folder can be used again.', 'site-agent-mcp-lite' ); ?></p>
+			<?php elseif ( ! $backups ) : ?>
 				<p><?php esc_html_e( 'No backup yet. Create one before letting an agent change the site.', 'site-agent-mcp-lite' ); ?></p>
 			<?php else : ?>
 				<table class="widefat striped samcp-table">
@@ -253,6 +287,9 @@ class Backup {
 								?>
 								<?php if ( $backup['warnings'] ) : ?>
 									<br><span class="samcp-muted"><?php echo esc_html( sprintf( /* translators: %d: count. */ _n( '%d warning', '%d warnings', $backup['warnings'], 'site-agent-mcp-lite' ), $backup['warnings'] ) ); ?></span>
+								<?php endif; ?>
+								<?php if ( ! empty( $backup['degraded'] ) ) : ?>
+									<br><span class="samcp-muted" data-samcp-degraded><?php echo esc_html( sprintf( /* translators: %d: count. */ _n( '%d file saved incomplete', '%d files saved incomplete', $backup['degraded'], 'site-agent-mcp-lite' ), $backup['degraded'] ) ); ?></span>
 								<?php endif; ?>
 								<?php if ( '' !== $reason ) : ?>
 									<br><span class="samcp-break"><?php echo esc_html( $reason ); ?></span>
@@ -310,13 +347,11 @@ class Backup {
 		$c   = __NAMESPACE__ . '\\Backup::';
 		// On multisite a backup holds the whole network: network administrators only.
 		$cap = is_multisite() ? 'manage_network_options' : 'manage_options';
-		$how = 'full' === SAMCP_EDITION
-			? 'Restoring is done by a person in Site Agent > Backups, never by an agent.'
-			: 'Restoring is never done by an agent: the person downloads the backup parts from Site Agent > Backups.';
+		$how = 'Restoring is never done by an agent: the person downloads the backup parts from Site Agent > Backups.';
 		return array(
 			'backup_create' => $make( 'Create a full backup', 'Back up the whole site: every database table of this WordPress and every file of the installation, with a manifest of the environment. Runs in slices: call backup_status until the state is complete. ' . $how, array(), array(), 'write', $c . 'tool_create', $cap ),
 			'backup_status' => $make( 'Backup progress and list', 'Advance a running backup by one slice and report its progress, and list the backups on this server.', array(), array(), 'write', $c . 'tool_status', $cap ),
-			'backup_verify' => $make( 'Verify a backup', 'Read a finished backup back and compare it with its manifest: every file entry, sizes, checksums and database statements. Changes nothing.', array( 'id' => $str ), array( 'id' ), 'read', $c . 'tool_verify', $cap ),
+			'backup_verify' => $make( 'Verify a backup', 'Read a finished backup back and compare it with its manifest: every file entry, sizes, checksums and database statements. degraded is true when some files changed while they were saved, so their copies are incomplete. Changes nothing.', array( 'id' => $str ), array( 'id' ), 'read', $c . 'tool_verify', $cap ),
 		);
 	}
 
@@ -334,7 +369,11 @@ class Backup {
 		$saved = wp_normalize_path( (string) get_option( self::DIR_OPTION, '' ) );
 		// The saved folder is used only if it has one of the two shapes this plugin creates:
 		// never trust a path just because it is stored, and put the deny rules back every time.
-		if ( '' !== $saved && self::is_storage_shape( $saved, $above ) && is_dir( $saved ) && wp_is_writable( $saved ) && ! is_link( $saved ) ) {
+		if ( '' !== $saved && self::is_storage_shape( $saved, $above ) && is_dir( $saved ) && ! is_link( $saved ) ) {
+			// Switching to a new, empty folder would hide the backups already made: say what is wrong instead.
+			if ( ! wp_is_writable( $saved ) ) {
+				throw new Tool_Error( 'The backup folder exists but PHP cannot write to it, so its backups cannot be used. The backups already made are still there. Give the web server write access to that folder again (Site Agent > Backups names it).' );
+			}
 			self::protect( $saved );
 			return $saved;
 		}
@@ -358,6 +397,97 @@ class Backup {
 			}
 		}
 		throw new Tool_Error( 'No folder is writable for backups on this server.' );
+	}
+
+	/**
+	 * Why the backup folder cannot be used, or null when it can.
+	 *
+	 * @return string|null English reason, also given to agents.
+	 */
+	public static function storage_problem() {
+		try {
+			self::storage();
+		} catch ( Tool_Error $e ) {
+			return $e->getMessage();
+		}
+		return null;
+	}
+
+	/**
+	 * Address of the witness file when the folder is inside the web root, or null.
+	 *
+	 * @param string $dir Storage folder.
+	 * @return string|null
+	 */
+	private static function witness_url( $dir ) {
+		$dir     = wp_normalize_path( $dir );
+		$content = trailingslashit( wp_normalize_path( WP_CONTENT_DIR ) );
+		if ( 0 === strpos( $dir, $content ) ) {
+			return content_url( '/' . substr( $dir, strlen( $content ) ) . '/' . self::WITNESS );
+		}
+		$root = trailingslashit( wp_normalize_path( ABSPATH ) );
+		if ( 0 === strpos( $dir, $root ) ) {
+			return site_url( '/' . substr( $dir, strlen( $root ) ) . '/' . self::WITNESS );
+		}
+		$web = self::web_path( $dir );
+		if ( null === $web ) {
+			return null;
+		}
+		// Above WordPress, under the document root: served from the host's root.
+		$home = wp_parse_url( home_url() );
+		$port = isset( $home['port'] ) ? ':' . $home['port'] : '';
+		return $home['scheme'] . '://' . $home['host'] . $port . '/' . ltrim( $web, '/' ) . '/' . self::WITNESS;
+	}
+
+	/**
+	 * Whether visitors can download files from the backup folder, checked over HTTP with a
+	 * harmless witness file: the deny rules are only a request to the web server.
+	 *
+	 * @param string $dir   Storage folder.
+	 * @param bool   $fresh Probe again instead of using the last result.
+	 * @return string 'outside' (not under the web root), 'blocked' (the witness is refused),
+	 *                'served' (the witness was downloaded) or 'unknown' (the site could not reach itself).
+	 */
+	public static function exposure( $dir, $fresh = false ) {
+		$url = self::witness_url( $dir );
+		if ( null === $url ) {
+			return 'outside';
+		}
+		$saved = get_transient( self::EXPOSURE );
+		if ( ! $fresh && is_array( $saved ) && isset( $saved['dir'], $saved['state'] ) && $saved['dir'] === $dir ) {
+			return (string) $saved['state'];
+		}
+		// New content on every probe, so a cached copy of an older witness proves nothing.
+		$marker = 'samcp-witness-' . bin2hex( random_bytes( 16 ) );
+		$state  = 'unknown';
+		if ( false !== file_put_contents( $dir . '/' . self::WITNESS, $marker . "\nA harmless test file: Site Agent MCP checks that visitors cannot download files from this folder.\n" ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions
+			$response = wp_remote_get(
+				$url,
+				array(
+					'timeout'     => 5,
+					'redirection' => 0,
+					'sslverify'   => apply_filters( 'https_local_ssl_verify', false ), // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals -- WordPress core filter.
+					'headers'     => array( 'Cache-Control' => 'no-cache' ),
+				)
+			);
+			if ( ! is_wp_error( $response ) ) {
+				$code = (int) wp_remote_retrieve_response_code( $response );
+				if ( false !== strpos( (string) wp_remote_retrieve_body( $response ), $marker ) ) {
+					$state = 'served';
+				} elseif ( in_array( $code, array( 401, 403, 404, 410 ), true ) ) {
+					$state = 'blocked';
+				}
+			}
+		}
+		set_transient(
+			self::EXPOSURE,
+			array(
+				'dir'   => $dir,
+				'state' => $state,
+			),
+			'blocked' === $state ? 6 * HOUR_IN_SECONDS : 10 * MINUTE_IN_SECONDS
+		);
+		return $state;
 	}
 
 	/**
@@ -545,6 +675,7 @@ class Backup {
 				'files'    => $manifest ? $manifest['files']['count'] : $job['file_index'],
 				'tables'   => $manifest ? count( $manifest['database']['tables'] ) : null,
 				'warnings' => count( $job['warnings'] ),
+				'degraded' => $manifest ? count( self::incomplete_files( $manifest ) ) : 0,
 			);
 		}
 		usort(
@@ -609,7 +740,17 @@ class Backup {
 		if ( $running ) {
 			return $running;
 		}
-		$root = self::storage();
+		$root     = self::storage();
+		$exposure = self::exposure( $root, true );
+		if ( 'served' === $exposure ) {
+			$web = self::web_path( $root );
+			throw new Tool_Error( sprintf( 'Not started: the web server lets anyone download files from the backup folder (/%s), so a backup there would be public. Ask the host to block that folder, or to let PHP write in the folder above WordPress, then try again.', esc_html( $web ) ) );
+		}
+		if ( 'unknown' === $exposure ) {
+			// An unproven folder is not a safe place for a copy of the database: stop with what to fix.
+			$web = self::web_path( $root );
+			throw new Tool_Error( sprintf( 'Not started: the site could not fetch a test file from the backup folder (/%s) over its own address, so it cannot prove that visitors are refused. Ask the host to let the site make HTTP requests to its own address, or to let PHP write in the folder above WordPress, then try again.', esc_html( $web ) ) );
+		}
 		$id   = gmdate( 'Ymd-His' ) . '-' . bin2hex( random_bytes( 8 ) );
 		$dir  = $root . '/' . $id;
 		wp_mkdir_p( $dir );
@@ -635,6 +776,8 @@ class Backup {
 				'file_count'  => 0,
 				'file_bytes'  => 0,
 				'db_rows'     => array(),
+				'row_key'     => null,
+				'incomplete'  => array(),
 				'warnings'    => array(),
 				'error'       => null,
 				'updated'     => time(),
@@ -776,7 +919,7 @@ class Backup {
 				'warnings'  => $job['warnings'] ? array_slice( $job['warnings'], 0, 20 ) : null,
 				'error'     => $job['error'],
 				'next'      => $done
-					? 'Run backup_verify with this id. Restoring is done by a person in Tools > Site Agent MCP.'
+					? 'Run backup_verify with this id. Restoring is done by a person in Site Agent > Backups.'
 					: ( 'failed' === $job['state'] ? 'Report the error to the user.' : 'Call backup_status again to continue.' ),
 			),
 			static function ( $value ) {
@@ -800,6 +943,63 @@ class Backup {
 			$roots['wp-content/'] = $content;
 		}
 		return $roots;
+	}
+
+	/**
+	 * Whether a file really lives in the archived folders once links are resolved, so a
+	 * link cannot pull a file from elsewhere on the server into a backup or an export.
+	 *
+	 * @param string $path     Path on this server.
+	 * @param string $relative Entry name: wp-config.php may be a link to a file kept elsewhere.
+	 * @return bool
+	 */
+	private static function inside_roots( $path, $relative = '' ) {
+		static $allowed = null;
+		if ( 'wp-config.php' === $relative || '../wp-config.php' === $relative ) {
+			return true;
+		}
+		if ( null === $allowed ) {
+			$allowed = array();
+			foreach ( self::roots() as $root ) {
+				$real      = realpath( $root );
+				$allowed[] = trailingslashit( wp_normalize_path( false === $real ? $root : $real ) );
+			}
+		}
+		$real = realpath( $path );
+		if ( false === $real ) {
+			return false;
+		}
+		$real = wp_normalize_path( $real );
+		foreach ( $allowed as $root ) {
+			if ( 0 === strpos( $real, $root ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Whether a link may be archived: its target is in the archived folders and in none
+	 * of the excluded ones, such as the backups themselves.
+	 *
+	 * @param string   $path     Link path.
+	 * @param string   $relative Entry name.
+	 * @param string[] $excluded Excluded folders.
+	 * @return bool
+	 */
+	private static function link_allowed( $path, $relative, array $excluded ) {
+		if ( ! self::inside_roots( $path, $relative ) ) {
+			return false;
+		}
+		$target = wp_normalize_path( (string) realpath( $path ) );
+		foreach ( $excluded as $skip ) {
+			$real = realpath( $skip );
+			$skip = wp_normalize_path( false === $real ? $skip : $real );
+			if ( $target === $skip || 0 === strpos( $target, $skip . '/' ) ) {
+				return false;
+			}
+		}
+		return 0 !== strpos( basename( $target ), 'samcp-' );
 	}
 
 	/**
@@ -872,6 +1072,10 @@ class Backup {
 					$job['warnings'][] = 'Not readable, skipped: ' . $relative;
 					continue;
 				}
+				if ( $file->isLink() && ! self::link_allowed( $file->getPathname(), $relative, $excluded ) ) {
+					$job['warnings'][] = 'Link to a file outside the archived folders, skipped: ' . $relative;
+					continue;
+				}
 				fwrite( $list, $relative . "\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 				++$count;
 				$bytes += (int) $file->getSize();
@@ -922,26 +1126,69 @@ class Backup {
 		if ( 0 === $job['table_index'] && 0 === $job['row_offset'] && 0 === $job['sql_size'] ) {
 			fwrite( $out, '/*!40101 SET NAMES ' . $wpdb->charset . " */;\nSET FOREIGN_KEY_CHECKS=0;\nSET SQL_MODE='NO_AUTO_VALUE_ON_ZERO';\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		}
-		while ( $job['table_index'] < count( $job['tables'] ) && microtime( true ) < $deadline ) {
+		$first = true;
+		// At least one page per call, so every slice moves the backup on.
+		while ( $job['table_index'] < count( $job['tables'] ) && ( $first || microtime( true ) < $deadline ) ) {
+			$first  = false;
 			$table  = $job['tables'][ $job['table_index'] ];
 			$quoted = '`' . str_replace( '`', '``', $table ) . '`';
 			if ( 0 === $job['row_offset'] ) {
 				$create = $wpdb->get_row( $wpdb->prepare( 'SHOW CREATE TABLE %i', $table ), ARRAY_N ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 				fwrite( $out, 'DROP TABLE IF EXISTS ' . $quoted . ";\n" . preg_replace( '/\s*\n\s*/', ' ', $create[1] ) . ";\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 				$job['db_rows'][ $table ] = 0;
+				$job['row_key']           = null;
 			}
-			$keys  = $wpdb->get_col( $wpdb->prepare( "SHOW KEYS FROM %i WHERE Key_name = 'PRIMARY'", $table ), 4 ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
-			$order = $keys ? ' ORDER BY ' . implode( ', ', array_map( static function ( $k ) { return '`' . str_replace( '`', '``', $k ) . '`'; }, $keys ) ) : ''; // phpcs:ignore Generic.Functions.OpeningFunctionBraceKernighanRitchie
-			// $order holds the primary key columns, each quoted as an identifier just above; their number varies, so %i cannot list them.
-			$rows  = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i' . $order . ' LIMIT %d, %d', $table, $job['row_offset'], self::ROWS ), ARRAY_N ); // phpcs:ignore WordPress.DB -- backup engine, no WP API exists; $order is quoted above
+			$keys = $wpdb->get_col( $wpdb->prepare( "SHOW KEYS FROM %i WHERE Key_name = 'PRIMARY'", $table ), 4 ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+			// Pages follow the primary key, not a position: rows added or removed meanwhile
+			// cannot shift a page, so no row is read twice or skipped. A job begun by an older
+			// version by position goes on by position.
+			$keyset = $keys && ( 0 === $job['row_offset'] || ! empty( $job['row_key'] ) );
+			if ( $keyset ) {
+				$columns = implode( ', ', array_fill( 0, count( $keys ), '%i' ) );
+				$sql     = 'SELECT * FROM %i';
+				$args    = array( $table );
+				if ( ! empty( $job['row_key'] ) ) {
+					// Binary key values travel in hex through job.json, which only holds valid UTF-8.
+					$hex          = isset( $job['row_key_hex'] ) ? (array) $job['row_key_hex'] : array();
+					$placeholders = array();
+					foreach ( array_keys( $keys ) as $i ) {
+						$placeholders[] = empty( $hex[ $i ] ) ? '%s' : 'UNHEX(%s)';
+					}
+					$sql .= ' WHERE (' . $columns . ') > (' . implode( ', ', $placeholders ) . ')';
+					$args = array_merge( $args, $keys, array_values( (array) $job['row_key'] ) );
+				}
+				$sql .= ' ORDER BY ' . $columns . ' LIMIT %d';
+				$args = array_merge( $args, $keys, array( self::ROWS ) );
+				// $sql holds only placeholders; their number follows the primary key.
+				$rows = $wpdb->get_results( $wpdb->prepare( $sql, $args ), ARRAY_A ); // phpcs:ignore WordPress.DB -- backup engine, no WP API exists
+			} else {
+				$order = $keys ? ' ORDER BY ' . implode( ', ', array_map( static function ( $k ) { return '`' . str_replace( '`', '``', $k ) . '`'; }, $keys ) ) : ''; // phpcs:ignore Generic.Functions.OpeningFunctionBraceKernighanRitchie
+				// $order holds the primary key columns, each quoted as an identifier just above; their number varies, so %i cannot list them.
+				$rows = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM %i' . $order . ' LIMIT %d, %d', $table, $job['row_offset'], self::ROWS ), ARRAY_A ); // phpcs:ignore WordPress.DB -- backup engine, no WP API exists; $order is quoted above
+				if ( ! $keys && self::ROWS === count( $rows ) && 0 === $job['row_offset'] ) {
+					$job['warnings'][] = 'Table without a primary key, read by position over several pages: rows changed during the backup may be missing or saved twice: ' . $table;
+				}
+			}
 			if ( $wpdb->last_error ) {
 				throw new Tool_Error( 'Reading ' . esc_html( $table ) . ' failed: ' . esc_html( $wpdb->last_error ) );
+			}
+			if ( $keyset && $rows ) {
+				$last               = end( $rows );
+				$job['row_key']     = array();
+				$job['row_key_hex'] = array();
+				foreach ( $keys as $key ) {
+					$value = (string) $last[ $key ];
+					// Not valid UTF-8 (a BINARY or VARBINARY key): JSON would alter it, so it is kept in hex.
+					$binary               = 1 !== preg_match( '//u', $value );
+					$job['row_key'][]     = $binary ? bin2hex( $value ) : $value;
+					$job['row_key_hex'][] = $binary;
+				}
 			}
 			$values = array();
 			$size   = 0;
 			foreach ( $rows as $row ) {
 				$cells = array();
-				foreach ( $row as $cell ) {
+				foreach ( array_values( $row ) as $cell ) {
 					$cells[] = null === $cell ? 'NULL' : "'" . $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $cell ) ) . "'";
 				}
 				$line     = '(' . implode( ',', $cells ) . ')';
@@ -960,6 +1207,7 @@ class Backup {
 			if ( count( $rows ) < self::ROWS ) {
 				++$job['table_index'];
 				$job['row_offset'] = 0;
+				$job['row_key']    = null;
 			} else {
 				$job['row_offset'] += self::ROWS;
 			}
@@ -1012,26 +1260,48 @@ class Backup {
 					++$job['file_index'];
 					continue;
 				}
-				$size               = (int) filesize( $path );
-				$job['entry_name']  = $relative;
-				$job['entry_size']  = $size;
-				$job['entry_md5']   = $size <= self::HASH_LIMIT ? (string) md5_file( $path ) : '';
-				$job['file_offset'] = 0;
+				// Checked again now: a link may have been pointed elsewhere since the listing.
+				if ( ! self::inside_roots( $path, $relative ) ) {
+					$job['warnings'][] = 'Link to a file outside the archived folders, skipped: ' . $relative;
+					++$job['file_index'];
+					continue;
+				}
+				$size                    = (int) filesize( $path );
+				$job['entry_name']       = $relative;
+				$job['entry_size']       = $size;
+				$job['entry_md5']        = $size <= self::HASH_LIMIT ? (string) md5_file( $path ) : '';
+				$job['entry_incomplete'] = false;
+				$job['file_offset']      = 0;
 				fwrite( $tar, self::tar_header( $relative, $size, (int) filemtime( $path ) ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 			}
 			$relative = $job['entry_name'];
+			$path     = self::absolute( $relative );
 			// Write the size announced in the header, even if the file changed since.
-			$source = fopen( self::absolute( $relative ), 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			$source = self::inside_roots( $path, $relative ) ? fopen( $path, 'rb' ) : false; // phpcs:ignore WordPress.WP.AlternativeFunctions
 			if ( $source ) {
 				fseek( $source, $job['file_offset'] );
 			}
+			// A file read whole in this slice gets the checksum of the bytes really archived.
+			$stream = 0 === $job['file_offset'] && '' !== $job['entry_md5'] ? hash_init( 'md5' ) : null;
 			while ( $job['file_offset'] < $job['entry_size'] ) {
 				$want  = (int) min( self::CHUNK, $job['entry_size'] - $job['file_offset'] );
 				$chunk = $source ? (string) fread( $source, $want ) : ''; // phpcs:ignore WordPress.WP.AlternativeFunctions
+				if ( strlen( $chunk ) < $want && $source ) {
+					// One more try: a read can come back short while another process writes the file.
+					clearstatcache( true, $path );
+					fseek( $source, $job['file_offset'] + strlen( $chunk ) );
+					$chunk .= (string) fread( $source, $want - strlen( $chunk ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+				}
 				if ( strlen( $chunk ) < $want ) {
-					$chunk            .= str_repeat( "\0", $want - strlen( $chunk ) );
-					$job['entry_md5']  = '';
-					$job['warnings'][] = 'Changed during the backup, saved incomplete: ' . $relative;
+					$chunk .= str_repeat( "\0", $want - strlen( $chunk ) );
+					if ( empty( $job['entry_incomplete'] ) ) {
+						$job['entry_incomplete'] = true;
+						$job['incomplete'][]     = $relative;
+						$job['warnings'][]       = 'Changed during the backup, saved incomplete: ' . $relative;
+					}
+				}
+				if ( $stream ) {
+					hash_update( $stream, $chunk );
 				}
 				fwrite( $tar, $chunk ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 				$job['file_offset'] += $want;
@@ -1044,6 +1314,27 @@ class Backup {
 			}
 			if ( $job['file_offset'] < $job['entry_size'] ) {
 				break;
+			}
+			if ( $stream ) {
+				$archived = hash_final( $stream );
+				if ( $archived !== $job['entry_md5'] && empty( $job['entry_incomplete'] ) ) {
+					// Same size, other bytes: the copy mixes two versions of the file.
+					$job['entry_incomplete'] = true;
+					$job['incomplete'][]     = $relative;
+					$job['warnings'][]       = 'Changed while it was read, saved as read: ' . $relative;
+				}
+				$job['entry_md5'] = $archived;
+			} elseif ( '' !== $job['entry_md5'] ) {
+				// Read over several slices: hash the bytes really archived, which end where the tar stands now.
+				$end      = ftell( $tar );
+				$archived = self::hash_range( $tar, $end - $job['entry_size'], $job['entry_size'] );
+				fseek( $tar, $end );
+				if ( $archived !== $job['entry_md5'] && empty( $job['entry_incomplete'] ) ) {
+					$job['entry_incomplete'] = true;
+					$job['incomplete'][]     = $relative;
+					$job['warnings'][]       = 'Changed while it was read, saved as read: ' . $relative;
+				}
+				$job['entry_md5'] = $archived;
 			}
 			$pad = ( 512 - $job['entry_size'] % 512 ) % 512;
 			if ( $pad ) {
@@ -1064,6 +1355,28 @@ class Backup {
 		fclose( $tar ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		fclose( $index ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		return $job;
+	}
+
+	/**
+	 * MD5 of a byte range of an open file.
+	 *
+	 * @param resource $handle File handle, read from $start.
+	 * @param int      $start  First byte.
+	 * @param int      $length Bytes to hash.
+	 * @return string
+	 */
+	private static function hash_range( $handle, $start, $length ) {
+		$context = hash_init( 'md5' );
+		fseek( $handle, $start );
+		while ( $length > 0 ) {
+			$chunk = (string) fread( $handle, (int) min( self::CHUNK, $length ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			if ( '' === $chunk ) {
+				break;
+			}
+			hash_update( $context, $chunk );
+			$length -= strlen( $chunk );
+		}
+		return hash_final( $context );
 	}
 
 	/**
@@ -1185,10 +1498,11 @@ class Backup {
 				'comments' => (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $wpdb->comments ) ), // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 			),
 			'database' => array(
-				'file'       => 'database.sql',
-				'bytes'      => self::size( $dir . '/database.sql' ),
-				'statements' => self::count_lines( $dir . '/database.sql' ),
-				'tables'     => $job['db_rows'],
+				'file'        => 'database.sql',
+				'bytes'       => self::size( $dir . '/database.sql' ),
+				'statements'  => self::count_lines( $dir . '/database.sql' ),
+				'tables'      => $job['db_rows'],
+				'consistency' => self::CONSISTENCY,
 			),
 			'files'    => array(
 				'file'  => 'files.tar',
@@ -1196,6 +1510,8 @@ class Backup {
 				'count' => self::count_lines( $dir . '/files.index' ),
 				'index' => 'files.index',
 			),
+			// Files whose copy is incomplete or mixes two versions: the backup is degraded.
+			'incomplete' => isset( $job['incomplete'] ) ? array_values( array_unique( (array) $job['incomplete'] ) ) : array(),
 			'warnings' => $job['warnings'],
 		);
 		self::write_json( $dir . '/manifest.json', $manifest );
@@ -1234,7 +1550,7 @@ class Backup {
 		$dir      = self::folder( $id );
 		$manifest = self::read_json( $dir . '/manifest.json' );
 		if ( ! $manifest ) {
-			return array( 'ok' => false, 'problems' => array( 'No manifest: the backup is unfinished or damaged.' ) );
+			return array( 'ok' => false, 'degraded' => false, 'problems' => array( 'No manifest: the backup is unfinished or damaged.' ) );
 		}
 		$problems = array();
 		$index    = array();
@@ -1317,14 +1633,41 @@ class Backup {
 		if ( count( $manifest['database']['tables'] ) !== $creates ) {
 			$problems[] = sprintf( '%d tables created, %d expected.', $creates, count( $manifest['database']['tables'] ) );
 		}
+		$incomplete = self::incomplete_files( $manifest );
+		$limits     = 'Files over 20 MB are checked by size only. A degraded backup reads back, but the files listed in incomplete do not match the site at any moment.';
+		$limits .= ' This proves the backup reads back, not that it restores on another server.';
 		return array(
-			'ok'       => ! $problems,
-			'id'       => $id,
-			'files'    => $seen,
-			'tables'   => $creates,
-			'problems' => array_slice( $problems, 0, 50 ),
-			'limits'   => 'Files over 20 MB are checked by size only. This proves the backup reads back, not that it restores on another server.',
+			'ok'               => ! $problems,
+			'id'               => $id,
+			'files'            => $seen,
+			'tables'           => $creates,
+			'problems'         => array_slice( $problems, 0, 50 ),
+			// Reads back, but some files were saved incomplete or changed while read.
+			'degraded'         => (bool) $incomplete,
+			'incomplete'       => array_slice( $incomplete, 0, 20 ),
+			'incomplete_count' => count( $incomplete ),
+			'limits'           => $limits,
 		);
+	}
+
+	/**
+	 * Files a backup saved incomplete, or as they changed while read.
+	 *
+	 * @param array $manifest Manifest.
+	 * @return string[]
+	 */
+	public static function incomplete_files( array $manifest ) {
+		if ( isset( $manifest['incomplete'] ) ) {
+			return array_values( array_map( 'strval', (array) $manifest['incomplete'] ) );
+		}
+		// Backups made before 0.9.0 only recorded a warning.
+		$files = array();
+		foreach ( isset( $manifest['warnings'] ) ? (array) $manifest['warnings'] : array() as $warning ) {
+			if ( 0 === strpos( (string) $warning, 'Changed during the backup, saved incomplete: ' ) ) {
+				$files[] = substr( (string) $warning, strlen( 'Changed during the backup, saved incomplete: ' ) );
+			}
+		}
+		return array_values( array_unique( $files ) );
 	}
 
 	/**
@@ -1395,13 +1738,20 @@ class Backup {
 	 * @return array
 	 */
 	private static function location() {
-		$web = self::web_path( self::storage() );
+		$dir      = self::storage();
+		$web      = self::web_path( $dir );
+		$exposure = self::exposure( $dir );
+		$texts    = array(
+			'outside' => 'Outside the web root, so visitors cannot reach it.',
+			'blocked' => 'Inside the web root, with deny rules. A test file there is refused to visitors over HTTP.',
+			'served'  => 'Inside the web root, and the web server serves its files to anyone: no new backup starts there. Ask the user to have the host block the folder shown in Site Agent > Backups.',
+			'unknown' => 'Inside the web root, with deny rules for Apache, LiteSpeed and IIS. The site could not check over HTTP that visitors are refused, so no new backup starts: ask the user to have the host allow the site to make HTTP requests to its own address, or to let PHP write in the folder above WordPress.',
+		);
 		// Agents learn whether the folder is served, never where it is: the path stays on the admin screen.
 		return array(
-			'storage'               => null === $web
-				? 'Outside the web root, so visitors cannot reach it.'
-				: 'Inside the web root, with deny rules for Apache, LiteSpeed and IIS. On Nginx, ask the user to check the folder shown in Site Agent > Backups, or to download and remove backups.',
-			'storage_in_web_root'   => null !== $web,
+			'storage'             => $texts[ $exposure ],
+			'storage_in_web_root' => null !== $web,
+			'storage_check'       => $exposure,
 		);
 	}
 }

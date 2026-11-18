@@ -129,8 +129,32 @@ class Store {
 		}
 	}
 
-	/** Stop scheduled work and end every connection: switching the plugin off must cut the agents. Data stays until uninstall. */
-	public static function deactivate() {
+	/**
+	 * Stop scheduled work and end every connection: switching the plugin off must cut the agents. Data stays until uninstall.
+	 * A network deactivation does it on every site of the network, since each site has its own tables.
+	 *
+	 * @param bool $network_wide Deactivated for the whole network.
+	 */
+	public static function deactivate( $network_wide = false ) {
+		$sites = is_multisite() && $network_wide ? get_sites(
+			array(
+				'fields' => 'ids',
+				'number' => 0,
+			)
+		) : array( 0 );
+		foreach ( $sites as $site_id ) {
+			if ( $site_id ) {
+				switch_to_blog( (int) $site_id );
+			}
+			self::deactivate_site();
+			if ( $site_id ) {
+				restore_current_blog();
+			}
+		}
+	}
+
+	/** Deactivation work for the current site. */
+	private static function deactivate_site() {
 		global $wpdb;
 		wp_clear_scheduled_hook( 'samcp_daily_cleanup' );
 		wp_clear_scheduled_hook( 'samcp_backup_tick' );
@@ -312,13 +336,13 @@ class Store {
 	 * @param string $kind   code, access or refresh.
 	 * @param array  $fields family, client_id, client_name, user_id, scope, resource, optional redirect_uri and code_challenge.
 	 * @param int    $ttl    Lifetime in seconds.
-	 * @return string
+	 * @return string Plain value, or an empty string when the row could not be stored.
 	 */
 	public static function issue( $kind, array $fields, $ttl ) {
 		global $wpdb;
 		$value = self::random( 32 );
 		$now   = time();
-		$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+		$saved = $wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 			self::table( 'tokens' ),
 			array(
 				'family'         => $fields['family'],
@@ -336,7 +360,54 @@ class Store {
 				'expires_at'     => $now + $ttl,
 			)
 		);
-		return $value;
+		// A value that is not stored would be announced to the client and then refused everywhere.
+		return 1 === $saved ? $value : '';
+	}
+
+	/**
+	 * Delete a code or token that was stored but must not be handed out.
+	 *
+	 * @param string|null $value Plain value; empty values are ignored.
+	 */
+	public static function discard( $value ) {
+		global $wpdb;
+		if ( null === $value || '' === $value ) {
+			return;
+		}
+		$wpdb->delete( self::table( 'tokens' ), array( 'token_hash' => self::hash( $value ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+	}
+
+	/**
+	 * Undo consume() when nothing was handed out, so the client can try the same code or token again.
+	 *
+	 * @param int $id Row id.
+	 */
+	public static function release( $id ) {
+		global $wpdb;
+		$wpdb->query( $wpdb->prepare( 'UPDATE %i SET used_at = NULL WHERE id = %d AND revoked_at IS NULL', self::table( 'tokens' ), $id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+	}
+
+	/**
+	 * Whether an authorization was withdrawn. Revocation always marks whole families, so one
+	 * revoked row is a lasting mark: rows a concurrent refresh inserts afterwards stay refused.
+	 *
+	 * @param string $family Family id.
+	 * @return bool
+	 */
+	public static function family_revoked( $family ) {
+		global $wpdb;
+		$table = self::table( 'tokens' );
+		return null !== $wpdb->get_var( $wpdb->prepare( 'SELECT id FROM %i WHERE family = %s AND revoked_at IS NOT NULL LIMIT 1', $table, $family ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+	}
+
+	/**
+	 * Whether the authorization a token descends from is past its maximum age.
+	 *
+	 * @param array $row Token row.
+	 * @return bool
+	 */
+	public static function grant_expired( array $row ) {
+		return self::granted_at( $row ) < time() - self::GRANT_MAX_AGE;
 	}
 
 	/**
@@ -469,18 +540,53 @@ class Store {
 	}
 
 	/**
-	 * Active connections, one row per authorization.
+	 * Query of the active connections, one row per authorization, not yet ordered.
 	 *
 	 * @param int|null $user_id Limit to a user.
+	 * @return string Prepared SQL.
+	 */
+	private static function connections_query( $user_id ) {
+		global $wpdb;
+		$sql = $wpdb->prepare( "SELECT family, client_name, user_id, scope, MIN(created_at) AS created_at, MAX(last_used_at) AS last_used_at FROM %i WHERE kind IN ('access','refresh') AND revoked_at IS NULL AND expires_at > %d AND (kind = 'access' OR used_at IS NULL)", self::table( 'tokens' ), time() );
+		if ( null !== $user_id ) {
+			$sql .= $wpdb->prepare( ' AND user_id = %d', $user_id );
+		}
+		return $sql . ' GROUP BY family, client_name, user_id, scope';
+	}
+
+	/**
+	 * Active connections, one row per authorization, newest first in a stable order.
+	 *
+	 * @param int|null $user_id Limit to a user.
+	 * @param int      $limit   Rows per page, 0 for every row.
+	 * @param int      $offset  Rows to skip.
 	 * @return array[]
 	 */
-	public static function connections( $user_id = null ) {
+	public static function connections( $user_id = null, $limit = 0, $offset = 0 ) {
 		global $wpdb;
-		$table = self::table( 'tokens' );
-		if ( null === $user_id ) {
-			return $wpdb->get_results( $wpdb->prepare( "SELECT family, client_name, user_id, scope, MIN(created_at) AS created_at, MAX(last_used_at) AS last_used_at FROM %i WHERE kind IN ('access','refresh') AND revoked_at IS NULL AND expires_at > %d AND (kind = 'access' OR used_at IS NULL) GROUP BY family, client_name, user_id, scope ORDER BY created_at DESC LIMIT 200", $table, time() ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+		// The family breaks ties, so two connections made the same second never swap pages.
+		$sql = self::connections_query( $user_id ) . ' ORDER BY created_at DESC, family ASC';
+		if ( $limit > 0 ) {
+			$sql .= $wpdb->prepare( ' LIMIT %d OFFSET %d', $limit, max( 0, (int) $offset ) );
 		}
-		return $wpdb->get_results( $wpdb->prepare( "SELECT family, client_name, user_id, scope, MIN(created_at) AS created_at, MAX(last_used_at) AS last_used_at FROM %i WHERE kind IN ('access','refresh') AND revoked_at IS NULL AND expires_at > %d AND (kind = 'access' OR used_at IS NULL) AND user_id = %d GROUP BY family, client_name, user_id, scope ORDER BY created_at DESC LIMIT 200", $table, time(), $user_id ), ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+		return $wpdb->get_results( $sql, ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.NotPrepared -- own tables, built from prepared parts above.
+	}
+
+	/**
+	 * Totals of the active connections, counted apart from any page of the list.
+	 *
+	 * @param int|null $user_id Limit to a user.
+	 * @return array{total:int,power:int,last_used:int} Connections, those with server tools, latest use.
+	 */
+	public static function connection_stats( $user_id = null ) {
+		global $wpdb;
+		$power = esc_sql( OAuth::SCOPE_POWER );
+		$row   = $wpdb->get_row( "SELECT COUNT(*) AS total, COALESCE(SUM(INSTR(scope, '{$power}') > 0), 0) AS power, COALESCE(MAX(last_used_at), 0) AS last_used FROM (" . self::connections_query( $user_id ) . ') AS c', ARRAY_A ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- own tables, built from prepared parts and a constant.
+		return array(
+			'total'     => isset( $row['total'] ) ? (int) $row['total'] : 0,
+			'power'     => isset( $row['power'] ) ? (int) $row['power'] : 0,
+			'last_used' => isset( $row['last_used'] ) ? (int) $row['last_used'] : 0,
+		);
 	}
 
 	/**
@@ -599,13 +705,37 @@ class Store {
 		return false;
 	}
 
+	/**
+	 * Count one event in a fixed time window and say how long to wait when the limit is reached.
+	 * Unlike over_limit(), steady use never extends the window.
+	 *
+	 * @param string $bucket Key.
+	 * @param int    $limit  Maximum events per window; 0 or less means no limit.
+	 * @param int    $window Window in seconds.
+	 * @return int Seconds to wait, or 0 when the event is allowed.
+	 */
+	public static function throttle( $bucket, $limit, $window ) {
+		if ( $limit <= 0 ) {
+			return 0;
+		}
+		$slot  = (int) floor( time() / $window );
+		$key   = 'samcp_tl_' . md5( $bucket . '|' . $slot );
+		$count = (int) get_transient( $key );
+		if ( $count >= $limit ) {
+			return max( 1, ( $slot + 1 ) * $window - time() );
+		}
+		set_transient( $key, $count + 1, $window );
+		return 0;
+	}
+
 	/** Remove expired tokens, unused registrations and old history. */
 	public static function cleanup() {
 		global $wpdb;
 		$tokens  = self::table( 'tokens' );
 		$clients = self::table( 'clients' );
 		$cutoff  = time() - self::RETENTION_DAYS * DAY_IN_SECONDS;
-		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE expires_at < %d', $tokens, $cutoff ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
+		// 30 days after expiry or revocation, whichever comes first: a revoked 90-day refresh token must not stay 120 days.
+		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE expires_at < %d OR revoked_at < %d', $tokens, $cutoff, $cutoff ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE created_at < %d', self::table( 'audit' ), $cutoff ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE created_at < %d', self::table( 'changes' ), $cutoff ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists
 		$wpdb->query( $wpdb->prepare( "DELETE c FROM %i c LEFT JOIN %i t ON t.client_id = c.client_id WHERE c.source = 'dcr' AND c.created_at < %d AND t.id IS NULL", $clients, $tokens, $cutoff ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery -- own tables / backup engine, no WP API exists

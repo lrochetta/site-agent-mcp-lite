@@ -19,6 +19,8 @@ class Admin_Bridge {
 	const SESSION_TTL  = 120;
 	const TEXT_LIMIT   = 6000;
 	const MAX_REDIRECT = 3;
+	/** Largest response body read from the site, so one huge page cannot exhaust PHP memory. */
+	const MAX_BODY = 5242880;
 
 	const SCRIPT_DATA_LIMIT = 2000;
 	const SCRIPT_DATA_TOTAL = 12000;
@@ -193,19 +195,31 @@ class Admin_Bridge {
 		$hops    = 0;
 		do {
 			self::assert_same_host( $url );
-			$args = array(
-				'method'      => $method,
-				'timeout'     => 30,
-				'redirection' => 0,
-				// Same check core uses for its own loopback requests.
-				'sslverify'   => apply_filters( 'https_local_ssl_verify', false ),
-				'cookies'     => $cookies,
-				'headers'     => $headers,
-				'body'        => 'GET' === $method ? null : $body,
+			$target = (string) apply_filters( 'samcp_loopback_url', $url );
+			$args   = array(
+				'method'              => $method,
+				'timeout'             => 30,
+				'redirection'         => 0,
+				/**
+				 * Whether the loopback request checks the site's TLS certificate. It carries an
+				 * admin session, so it does by default. A site whose own address has a certificate
+				 * the server does not trust can turn it off, or trust its authority through the
+				 * sslcertificates argument of the http_request_args filter.
+				 *
+				 * @param bool   $verify Check the certificate.
+				 * @param string $target Address requested.
+				 */
+				'sslverify'           => (bool) apply_filters( 'samcp_loopback_sslverify', true, $target ),
+				'limit_response_size' => self::MAX_BODY,
+				'cookies'             => $cookies,
+				'headers'             => $headers,
+				'body'                => 'GET' === $method ? null : $body,
 			);
-			$response = wp_remote_request( (string) apply_filters( 'samcp_loopback_url', $url ), $args );
+			$response = wp_remote_request( $target, $args );
 			if ( is_wp_error( $response ) ) {
-				throw new Tool_Error( 'The site could not reach itself: ' . esc_html( $response->get_error_message() ) . '. Some hosts block loopback requests; the samcp_loopback_url filter can point to an internal address.' );
+				$message = $response->get_error_message();
+				$hint    = preg_match( '/certificate|ssl|tls/i', $message ) ? ' The certificate of the site\'s own address is not trusted by this server; the samcp_loopback_sslverify filter can turn the check off for a self-signed certificate.' : ' Some hosts block loopback requests; the samcp_loopback_url filter can point to an internal address.';
+				throw new Tool_Error( 'The site could not reach itself: ' . esc_html( $message ) . '.' . $hint ); // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- fixed text around an escaped message
 			}
 			$status   = (int) wp_remote_retrieve_response_code( $response );
 			$location = (string) wp_remote_retrieve_header( $response, 'location' );
@@ -222,19 +236,36 @@ class Admin_Bridge {
 			if ( ! self::is_site_url( $next ) ) {
 				break;
 			}
-			$url    = $next;
-			$method = 'GET';
-			$body   = '';
+			$url = $next;
+			// 307 and 308 repeat the same request at the new address; the others continue as a GET, as browsers do.
+			if ( ! in_array( $status, array( 307, 308 ), true ) ) {
+				$method = 'GET';
+				$body   = '';
+			}
 		} while ( ++$hops <= self::MAX_REDIRECT );
 
 		$response_headers = wp_remote_retrieve_headers( $response );
+		$response_body    = (string) wp_remote_retrieve_body( $response );
 		return array(
-			'status'      => $status,
-			'headers'     => is_object( $response_headers ) ? $response_headers->getAll() : (array) $response_headers,
-			'body'        => (string) wp_remote_retrieve_body( $response ),
-			'final_url'   => $url,
-			'duration_ms' => (int) round( ( microtime( true ) - $started ) * 1000 ),
+			'status'         => $status,
+			'headers'        => is_object( $response_headers ) ? $response_headers->getAll() : (array) $response_headers,
+			'body'           => $response_body,
+			'body_truncated' => strlen( $response_body ) >= self::MAX_BODY,
+			'final_url'      => $url,
+			'duration_ms'    => (int) round( ( microtime( true ) - $started ) * 1000 ),
 		);
+	}
+
+	/**
+	 * Whether a response says no: an HTTP error status, or the JSON that WordPress AJAX
+	 * handlers send on failure ({"success": false}) under HTTP 200.
+	 *
+	 * @param int   $status HTTP status.
+	 * @param mixed $json   Decoded JSON body, or null.
+	 * @return bool
+	 */
+	public static function is_refusal( $status, $json ) {
+		return (int) $status >= 400 || ( is_array( $json ) && array_key_exists( 'success', $json ) && false === $json['success'] );
 	}
 
 	/**
@@ -339,6 +370,8 @@ class Admin_Bridge {
 			'reliability'     => $is_js_screen ? 'partial_javascript_screen' : 'parsed_form',
 			'status'          => $page['status'],
 			'url'             => $page['final_url'],
+			// Over 5 MiB the page is cut: forms and text past the cut are missing.
+			'body_truncated'  => ! empty( $page['body_truncated'] ),
 			'title'           => self::text( $title ),
 			'notices'         => array_slice( array_unique( $notices ), 0, 10 ),
 			'forms'           => $public,
@@ -572,11 +605,16 @@ class Admin_Bridge {
 	private static function build_payload( array $form, array $values, $allow_unknown, $submit ) {
 		$current = array();
 		$known   = array_keys( $form['hidden'] );
+		$secret  = array();
 		foreach ( $form['hidden'] as $name => $list ) {
 			$current[ $name ] = '[]' === substr( $name, -2 ) ? $list : array( end( $list ) );
 		}
 		foreach ( $form['fields'] as $field ) {
 			$known[] = $field['name'];
+			// A password input stays confidential whatever its name, as it is when the page is read.
+			if ( 'password' === $field['type'] ) {
+				$secret[ $field['name'] ] = true;
+			}
 			if ( in_array( $field['type'], array( 'checkbox', 'radio' ), true ) && empty( $field['checked'] ) ) {
 				continue;
 			}
@@ -601,22 +639,14 @@ class Admin_Bridge {
 			}
 			$after = isset( $current[ $name ] ) ? $current[ $name ] : null;
 			if ( $before !== $after ) {
-				$changes[ $name ] = Tools::is_secret_name( $name ) ? array( 'changed' => true ) : array(
+				$changes[ $name ] = isset( $secret[ $name ] ) || Tools::is_secret_name( $name ) ? array( 'changed' => true ) : array(
 					'from' => $before,
 					'to'   => $after,
 				);
 			}
 		}
 
-		$chosen = null;
-		foreach ( $form['submits'] as $button ) {
-			if ( '' === $submit ? ( null === $chosen && '' !== $button['name'] ) : $button['name'] === $submit ) {
-				$chosen = $button;
-			}
-		}
-		if ( '' !== $submit && ! $chosen ) {
-			throw new Tool_Error( 'This form has no submit button named "' . esc_html( $submit ) . '".' );
-		}
+		$chosen = self::choose_submit( $form['submits'], $submit );
 		if ( $chosen ) {
 			$current[ $chosen['name'] ] = array( $chosen['value'] );
 		}
@@ -628,10 +658,59 @@ class Admin_Bridge {
 			}
 		}
 		return array(
-			'body'    => implode( '&', $pairs ),
-			'changes' => $changes,
-			'submit'  => $chosen ? $chosen['name'] : '',
+			'body'         => implode( '&', $pairs ),
+			'changes'      => $changes,
+			'submit'       => $chosen ? $chosen['name'] : '',
+			'submit_value' => $chosen ? $chosen['value'] : '',
+			'submit_label' => $chosen ? $chosen['label'] : '',
 		);
+	}
+
+	/**
+	 * Pick the submit button a person would press. Buttons often share a name, such as
+	 * "action", and differ by value, so "name=value" picks one of them; a bare name that
+	 * matches buttons with different values is refused rather than guessed.
+	 *
+	 * @param array[] $buttons Submit buttons of the form.
+	 * @param string  $submit  Name, or name=value; empty for the first named button.
+	 * @return array|null Chosen button.
+	 * @throws Tool_Error When no button matches, or several do.
+	 */
+	private static function choose_submit( array $buttons, $submit ) {
+		$submit = (string) $submit;
+		if ( '' === $submit ) {
+			foreach ( $buttons as $button ) {
+				if ( '' !== $button['name'] ) {
+					return $button;
+				}
+			}
+			return null;
+		}
+		$matches = array();
+		foreach ( $buttons as $button ) {
+			if ( '' !== $button['name'] && $button['name'] === $submit ) {
+				$matches[ $button['value'] ] = $button;
+			}
+		}
+		if ( ! $matches && false !== strpos( $submit, '=' ) ) {
+			list( $name, $value ) = explode( '=', $submit, 2 );
+			foreach ( $buttons as $button ) {
+				if ( '' !== $button['name'] && $button['name'] === $name && $button['value'] === $value ) {
+					$matches[ $button['value'] ] = $button;
+				}
+			}
+		}
+		if ( ! $matches ) {
+			throw new Tool_Error( 'This form has no submit button "' . esc_html( $submit ) . '". Give its name, or name=value when several buttons share a name.' );
+		}
+		if ( count( $matches ) > 1 ) {
+			$choices = array();
+			foreach ( $matches as $button ) {
+				$choices[] = $button['name'] . '=' . $button['value'] . ( '' !== $button['label'] ? ' (' . $button['label'] . ')' : '' );
+			}
+			throw new Tool_Error( 'Submit button "' . esc_html( $submit ) . '" is ambiguous: several buttons share this name. Choose one as name=value: ' . esc_html( implode( ', ', $choices ) ) . '.' );
+		}
+		return reset( $matches );
 	}
 
 	/**
@@ -650,6 +729,10 @@ class Admin_Bridge {
 		$url = self::admin_target( $path );
 		Tools::lite_check_admin_target( $url, array() );
 		$page = $this->request( 'GET', $url );
+		if ( ! empty( $page['body_truncated'] ) ) {
+			// Fields after the cut would be left out of the POST, and most settings screens read a missing field as cleared.
+			throw new Tool_Error( 'This admin screen is larger than 5 MiB, so its form cannot be read completely. Nothing was sent.' );
+		}
 		$dom   = self::dom( $page['body'] );
 		$xpath = new \DOMXPath( $dom );
 		$root  = $xpath->query( '//*[@id="wpbody-content"]' )->item( 0 );
@@ -670,6 +753,10 @@ class Admin_Bridge {
 				'method'  => $form['method'],
 				'changes' => $payload['changes'],
 				'submit'  => $payload['submit'],
+				'button'  => array(
+					'value' => $payload['submit_value'],
+					'label' => $payload['submit_label'],
+				),
 				'next'    => 'Nothing was sent. Call again with dry_run set to false to apply these changes.',
 			);
 		}
@@ -695,9 +782,12 @@ class Admin_Bridge {
 				$notices[] = substr( $text, 0, 300 );
 			}
 		}
+		$refused = self::is_refusal( $result['status'], json_decode( $result['body'], true ) );
 		return array(
+			'_is_error'       => $refused,
 			'content_trust'   => 'untrusted_site_content',
 			'reliability'     => 'parsed_form',
+			'refused'         => $refused,
 			'status'          => $result['status'],
 			'final_url'       => $result['final_url'],
 			'requested'       => $payload['changes'],

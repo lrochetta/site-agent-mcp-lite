@@ -858,3 +858,28 @@
 .samcp-pairing {
 	border-inline-start: 4px solid var(--samcp-accent, #2271b1);
 }
+
+/* A field the last save could not use: its message, tied to it with aria-describedby. */
+.samcp .samcp-field-error {
+	color: var(--samcp-error-text);
+	font-weight: 600;
+}
+
+.samcp input[aria-invalid="true"] {
+	border-color: var(--samcp-error);
+}
+
+/* Return addresses an action did not keep, listed in its notice. */
+.samcp .samcp-rejected {
+	margin: 0 0 var(--samcp-space-2);
+	padding-inline-start: var(--samcp-space-4);
+	list-style: disc;
+}
+
+.samcp .samcp-rejected code {
+	overflow-wrap: anywhere;
+}
+
+.samcp .samcp-remove-secret {
+	margin-block: var(--samcp-space-1) 0;
+}

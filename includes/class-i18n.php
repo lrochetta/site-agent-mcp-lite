@@ -36,24 +36,116 @@ class I18n {
 
 	/** Locale shipped for each language, used when the exact locale has no file. */
 	const FALLBACK = array(
-		'ar' => 'ar',
-		'de' => 'de_DE',
-		'es' => 'es_ES',
-		'fr' => 'fr_FR',
-		'he' => 'he_IL',
-		'hi' => 'hi_IN',
-		'it' => 'it_IT',
-		'nl' => 'nl_NL',
-		'pt' => 'pt_BR',
-		'th' => 'th',
-		'zh' => 'zh_CN',
+		'af'  => 'af',
+		'am'  => 'am',
+		'ar'  => 'ar',
+		'arg' => 'arg',
+		'ary' => 'ary',
+		'as'  => 'as',
+		'az'  => 'az',
+		'azb' => 'azb',
+		'bcc' => 'bcc',
+		'bel' => 'bel',
+		'bg'  => 'bg_BG',
+		'bn'  => 'bn_BD',
+		'bo'  => 'bo',
+		'bs'  => 'bs_BA',
+		'ca'  => 'ca',
+		'ceb' => 'ceb',
+		'ckb' => 'ckb',
+		'cs'  => 'cs_CZ',
+		'cy'  => 'cy',
+		'da'  => 'da_DK',
+		'de'  => 'de_DE',
+		'dsb' => 'dsb',
+		'dzo' => 'dzo',
+		'el'  => 'el',
+		'eo'  => 'eo',
+		'es'  => 'es_ES',
+		'et'  => 'et',
+		'eu'  => 'eu',
+		'fa'  => 'fa_IR',
+		'fi'  => 'fi',
+		'fr'  => 'fr_FR',
+		'fur' => 'fur',
+		'fy'  => 'fy',
+		'gd'  => 'gd',
+		'gl'  => 'gl_ES',
+		'gu'  => 'gu',
+		'haz' => 'haz',
+		'he'  => 'he_IL',
+		'hi'  => 'hi_IN',
+		'hr'  => 'hr',
+		'hsb' => 'hsb',
+		'hu'  => 'hu_HU',
+		'hy'  => 'hy',
+		'id'  => 'id_ID',
+		'is'  => 'is_IS',
+		'it'  => 'it_IT',
+		'ja'  => 'ja',
+		'jv'  => 'jv_ID',
+		'ka'  => 'ka_GE',
+		'kab' => 'kab',
+		'kir' => 'kir',
+		'kk'  => 'kk',
+		'km'  => 'km',
+		'kmr' => 'kmr',
+		'kn'  => 'kn',
+		'ko'  => 'ko_KR',
+		'lo'  => 'lo',
+		'lt'  => 'lt_LT',
+		'lv'  => 'lv',
+		'mk'  => 'mk_MK',
+		'ml'  => 'ml_IN',
+		'mn'  => 'mn',
+		'mr'  => 'mr',
+		'ms'  => 'ms_MY',
+		'my'  => 'my_MM',
+		'nb'  => 'nb_NO',
+		'ne'  => 'ne_NP',
+		'nl'  => 'nl_NL',
+		'nn'  => 'nn_NO',
+		'oci' => 'oci',
+		'pa'  => 'pa_IN',
+		'pcm' => 'pcm',
+		'pl'  => 'pl_PL',
+		'ps'  => 'ps',
+		'pt'  => 'pt_BR',
+		'rhg' => 'rhg',
+		'ro'  => 'ro_RO',
+		'ru'  => 'ru_RU',
+		'sah' => 'sah',
+		'si'  => 'si_LK',
+		'sk'  => 'sk_SK',
+		'skr' => 'skr',
+		'sl'  => 'sl_SI',
+		'snd' => 'snd',
+		'sq'  => 'sq',
+		'sr'  => 'sr_RS',
+		'sv'  => 'sv_SE',
+		'sw'  => 'sw',
+		'szl' => 'szl',
+		'ta'  => 'ta_IN',
+		'tah' => 'tah',
+		'te'  => 'te',
+		'th'  => 'th',
+		'tl'  => 'tl',
+		'tr'  => 'tr_TR',
+		'tt'  => 'tt_RU',
+		'ug'  => 'ug_CN',
+		'uk'  => 'uk',
+		'ur'  => 'ur',
+		'uz'  => 'uz_UZ',
+		'vi'  => 'vi',
+		'yor' => 'yor',
+		'zh'  => 'zh_CN',
 	);
 
-	/** Chinese written in traditional characters: never shown the simplified file. */
+	/** Chinese written in traditional characters: shown the traditional file, never the simplified one. */
 	const TRADITIONAL = array( 'zh_TW', 'zh_HK', 'zh_MO' );
 
 	/** Languages written right to left. */
-	const RTL = array( 'ar', 'arc', 'ckb', 'dv', 'fa', 'haz', 'he', 'ps', 'sd', 'ug', 'ur', 'yi' );
+	const RTL = array( 'ar', 'arc', 'ary', 'azb', 'bcc', 'ckb', 'dv', 'fa', 'haz', 'he', 'ps', 'sd', 'skr', 'snd', 'ug', 'ur', 'yi' );
 
 	/**
 	 * Locale of the file loaded, null when none.
@@ -109,7 +201,7 @@ class I18n {
 	/**
 	 * Locales whose file can serve a locale: itself, then the shipped locale of its
 	 * language. fr_CA gets fr_FR, de_DE_formal gets de_DE, pt_PT gets pt_BR, zh_SG
-	 * gets zh_CN, but zh_TW and zh_HK get nothing.
+	 * gets zh_CN, zh_HK gets zh_TW.
 	 *
 	 * @param string $locale Locale.
 	 * @return string[]
@@ -117,7 +209,9 @@ class I18n {
 	public static function candidates( $locale ) {
 		$list = array( $locale );
 		$lang = explode( '_', $locale )[0];
-		if ( isset( self::FALLBACK[ $lang ] ) && ! in_array( substr( $locale, 0, 5 ), self::TRADITIONAL, true ) ) {
+		if ( in_array( substr( $locale, 0, 5 ), self::TRADITIONAL, true ) ) {
+			$list[] = 'zh_TW';
+		} elseif ( isset( self::FALLBACK[ $lang ] ) ) {
 			$list[] = self::FALLBACK[ $lang ];
 		}
 		return array_values( array_unique( $list ) );

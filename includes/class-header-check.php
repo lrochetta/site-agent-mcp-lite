@@ -300,7 +300,11 @@ class Header_Check {
 		}
 	}
 
-	/** Remove the block, on uninstall. */
+	/**
+	 * Remove the block and the backup copies, from Settings or on uninstall.
+	 *
+	 * @return bool Whether .htaccess is now free of the block, checked on the file itself.
+	 */
 	public static function remove() {
 		$path = self::htaccess_path();
 		if ( is_file( $path ) && wp_is_writable( $path ) ) {
@@ -312,5 +316,7 @@ class Header_Check {
 		}
 		self::remove_backups();
 		self::forget();
+		clearstatcache( true, $path );
+		return ! self::has_block();
 	}
 }

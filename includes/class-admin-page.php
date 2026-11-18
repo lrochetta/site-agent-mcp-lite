@@ -27,6 +27,15 @@ class Admin_Page {
 	const ACTIVITY_PER_PAGE = 25;
 
 	/**
+	 * Where Lite is published today. Its wordpress.org listing is not approved yet:
+	 * name that channel only once the listing exists.
+	 */
+	const LITE_SOURCE_URL = 'https://github.com/lrochetta/site-agent-mcp-lite';
+
+	/** Rows per page of the connections table. */
+	const CONNECTIONS_PER_PAGE = 50;
+
+	/**
 	 * Hook suffix of the screen, to load assets there only.
 	 *
 	 * @var string
@@ -238,6 +247,13 @@ class Admin_Page {
 				'inProgress'  => __( 'Backup in progress', 'site-agent-mcp-lite' ),
 				'lostContact' => __( 'Lost contact with the site after 3 attempts. The backup goes on in the background.', 'site-agent-mcp-lite' ),
 				'retrying'    => __( 'Trying again.', 'site-agent-mcp-lite' ),
+				// The pairing panel once its window has closed, without reloading the page.
+				'pairing'     => array(
+					'closed' => __( 'Closed', 'site-agent-mcp-lite' ),
+					'text'   => __( 'To connect an app, open new connections here, then start from the app within 15 minutes. A link received by email or chat can never connect an app on its own.', 'site-agent-mcp-lite' ),
+					'button' => __( 'Allow a new connection', 'site-agent-mcp-lite' ),
+					'ended'  => __( 'New connections are now closed.', 'site-agent-mcp-lite' ),
+				),
 				/* translators: Backup progress. 1: phase, such as "Archiving files", 2: count, such as "120 of 3,400 files". */
 				'withDetail'  => __( '%1$s (%2$s)', 'site-agent-mcp-lite' ),
 				'phases'      => array(
@@ -269,24 +285,43 @@ class Admin_Page {
 		exit;
 	}
 
+	/**
+	 * Keep the return addresses an action refused, for the notice of the next page load.
+	 *
+	 * @param string[] $rejected Addresses as typed.
+	 */
+	private static function keep_rejected( array $rejected ) {
+		if ( $rejected ) {
+			set_transient( 'samcp_rejected_' . get_current_user_id(), array_slice( array_values( array_unique( $rejected ) ), 0, 20 ), 5 * MINUTE_IN_SECONDS );
+		}
+	}
+
 	/** Save site settings. */
 	public static function save_settings() {
 		check_admin_referer( 'samcp_settings' );
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
 		}
+		// On multisite only a network administrator may change this network-wide setting.
+		if ( 'lite' === SAMCP_EDITION && Release_Notice::can_manage() ) {
+			Release_Notice::set_enabled( isset( $_POST['release_notice'] ) );
+		}
 		$lines = isset( $_POST['extra_redirects'] ) ? explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['extra_redirects'] ) ) ) : array();
-		$valid = array();
+		$valid    = array();
+		$rejected = array();
 		foreach ( $lines as $line ) {
 			$line   = trim( $line );
 			$scheme = strtolower( (string) wp_parse_url( $line, PHP_URL_SCHEME ) );
 			// HTTPS and app schemes only: script-like schemes would run in the browser on redirect.
 			if ( '' !== $scheme && ! in_array( $scheme, array( 'http', 'javascript', 'data', 'vbscript', 'file', 'about', 'blob' ), true ) ) {
 				$valid[] = $line;
+			} elseif ( '' !== $line ) {
+				$rejected[] = $line;
 			}
 		}
 		update_option( 'samcp_extra_redirects', implode( "\n", array_unique( $valid ) ), false );
-		self::back( 'saved', 'settings' );
+		self::keep_rejected( $rejected );
+		self::back( $rejected ? 'redirects_rejected' : 'saved', 'settings' );
 	}
 
 	/** Save who may connect agents and how far connections go. */
@@ -294,6 +329,10 @@ class Admin_Page {
 		check_admin_referer( 'samcp_access' );
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
+		}
+		if ( isset( $_POST['enabled'] ) && ! Policy::enabled() ) {
+			// The endpoint check waited for this: its old result would mislead.
+			delete_transient( self::CHECKS );
 		}
 		update_option( 'samcp_enabled', isset( $_POST['enabled'] ) ? 1 : 0, false );
 		update_option( 'samcp_allow_extensions', isset( $_POST['allow_extensions'] ) ? 1 : 0, false );
@@ -323,6 +362,8 @@ class Admin_Page {
 				$users[ $user->ID ] = $level;
 			} else {
 				$notice = 'user_unknown';
+				// Shown again in its field on the next page load, so the person can correct it.
+				set_transient( 'samcp_unknown_user_' . get_current_user_id(), array( 'who' => $who, 'level' => $level ), 5 * MINUTE_IN_SECONDS );
 			}
 		}
 		Policy::save_settings( $roles, $users );
@@ -351,6 +392,8 @@ class Admin_Page {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
 		}
 		update_option( 'samcp_enabled', 1, false );
+		// The endpoint check waited for this: its old result would mislead.
+		delete_transient( self::CHECKS );
 		self::back( 'switched_on', 'access' );
 	}
 
@@ -370,8 +413,7 @@ class Admin_Page {
 		if ( ! current_user_can( 'manage_options' ) || ( is_multisite() && ! is_super_admin() ) ) {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
 		}
-		Header_Check::remove();
-		self::back( 'header_removed', 'settings' );
+		self::back( Header_Check::remove() ? 'header_removed' : 'header_remove_failed', 'settings' );
 	}
 
 	/** Lite edition: hide the block about Site Agent MCP Full for this administrator. */
@@ -385,7 +427,11 @@ class Admin_Page {
 		exit;
 	}
 
-	/** Save service credentials. A blank field keeps the stored value, since the page never shows it. A dash removes it. */
+	/**
+	 * Save service credentials. A blank field keeps the stored value, since the page
+	 * never shows it. The "Remove" box deletes it; a single dash still does, for
+	 * people used to the old convention.
+	 */
 	public static function save_services() {
 		check_admin_referer( 'samcp_services' );
 		if ( ! current_user_can( 'manage_options' ) ) {
@@ -394,12 +440,18 @@ class Admin_Page {
 		$old_client = (string) get_option( Search_Console::ID_OPTION, '' );
 		$user       = wp_get_current_user();
 		$autofilled = false;
+		$removed    = false;
 		foreach ( array(
 			'google_api_key'    => Seo_Tools::GOOGLE_OPTION,
 			'gtmetrix_api_key'  => Seo_Tools::GTMETRIX_OPTION,
 			'gsc_client_id'     => Search_Console::ID_OPTION,
 			'gsc_client_secret' => Search_Console::SECRET_OPTION,
 		) as $field => $option ) {
+			if ( isset( $_POST[ $field . '_remove' ] ) ) {
+				$removed = $removed || '' !== (string) get_option( $option, '' );
+				delete_option( $option );
+				continue;
+			}
 			$raw   = isset( $_POST[ $field ] ) ? (string) wp_unslash( $_POST[ $field ] ) : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
 			$value = sanitize_text_field( $raw );
 			// Browsers fill these fields with the WordPress login and password. Never store those.
@@ -408,6 +460,7 @@ class Admin_Page {
 				continue;
 			}
 			if ( '-' === $value ) {
+				$removed = $removed || '' !== (string) get_option( $option, '' );
 				delete_option( $option );
 			} elseif ( '' !== $value ) {
 				update_option( $option, $value, false );
@@ -417,7 +470,12 @@ class Admin_Page {
 		if ( (string) get_option( Search_Console::ID_OPTION, '' ) !== $old_client ) {
 			Search_Console::forget_tokens();
 		}
-		self::back( $autofilled ? 'autofilled' : 'saved', 'services' );
+		if ( $autofilled ) {
+			$notice = 'autofilled';
+		} else {
+			$notice = $removed ? 'secret_removed' : 'saved';
+		}
+		self::back( $notice, 'services' );
 	}
 
 	/** Try each configured service and keep the results for the next page load. */
@@ -485,7 +543,10 @@ class Admin_Page {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
 		}
 		Store::revoke_family( $family );
-		self::back( 'revoked', 'connect' );
+		// Back to the page of the list the person was on.
+		$paged = isset( $_POST['paged'] ) ? absint( wp_unslash( $_POST['paged'] ) ) : 1;
+		wp_safe_redirect( self::url( 'connect', $paged > 1 ? array( 'paged' => $paged, 'samcp_notice' => 'revoked' ) : array( 'samcp_notice' => 'revoked' ) ) );
+		exit;
 	}
 
 	/** Create a client for applications that need pre-registered credentials. */
@@ -495,22 +556,26 @@ class Admin_Page {
 			wp_die( esc_html__( 'You are not allowed to do this.', 'site-agent-mcp-lite' ), 403 );
 		}
 		$name = isset( $_POST['client_name'] ) ? sanitize_text_field( wp_unslash( $_POST['client_name'] ) ) : '';
-		$uris = isset( $_POST['redirect_uris'] ) ? array_values( array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['redirect_uris'] ) ) ) ) ) ) : array();
-		$uris = array_values(
-			array_filter(
-				$uris,
-				static function ( $uri ) {
-					return in_array( strtolower( (string) wp_parse_url( $uri, PHP_URL_SCHEME ) ), array( 'https', 'http' ), true );
-				}
-			)
-		);
+		$lines    = isset( $_POST['redirect_uris'] ) ? array_values( array_filter( array_map( 'trim', explode( "\n", sanitize_textarea_field( wp_unslash( $_POST['redirect_uris'] ) ) ) ) ) ) : array();
+		$uris     = array();
+		$rejected = array();
+		foreach ( $lines as $uri ) {
+			// Plain http only for an app on the person's own computer, as the notice says.
+			$scheme = strtolower( (string) wp_parse_url( $uri, PHP_URL_SCHEME ) );
+			if ( 'https' === $scheme || ( 'http' === $scheme && OAuth::is_loopback( $uri ) ) ) {
+				$uris[] = $uri;
+			} else {
+				$rejected[] = $uri;
+			}
+		}
+		self::keep_rejected( $rejected );
 		if ( '' === $name || ! $uris ) {
 			self::back( 'client_invalid', 'connect' );
 		}
 		$client = Store::create_client( $name, $uris, 'manual', true );
 		// Shown once on the next page load, then gone.
 		set_transient( 'samcp_new_client_' . get_current_user_id(), $client, 5 * MINUTE_IN_SECONDS );
-		self::back( 'client_created', 'connect' );
+		self::back( $rejected ? 'client_created_partial' : 'client_created', 'connect' );
 	}
 
 	/** Delete a client. */
@@ -532,8 +597,10 @@ class Admin_Page {
 		set_transient(
 			self::CHECKS,
 			array(
-				'time'    => time(),
-				'results' => self::diagnostics(),
+				'time'     => time(),
+				'results'  => self::diagnostics(),
+				// Checks that cannot give a verdict yet: the endpoint answers 503 while switched off.
+				'deferred' => Policy::enabled() ? array() : array( 'endpoint' ),
 			),
 			12 * HOUR_IN_SECONDS
 		);
@@ -562,8 +629,11 @@ class Admin_Page {
 			'https'      => is_ssl() || 0 === strpos( home_url(), 'https://' ),
 			'permalinks' => '' !== (string) get_option( 'permalink_structure' ),
 			'discovery'  => is_array( $document ) && isset( $document['issuer'] ) && OAuth::issuer() === $document['issuer'],
-			'endpoint'   => ! is_wp_error( $endpoint ) && 401 === (int) wp_remote_retrieve_response_code( $endpoint ) && false !== strpos( $challenge, 'resource_metadata' ),
 		);
+		// Switched off, the endpoint answers 503 on purpose: no verdict until agents are switched on.
+		if ( Policy::enabled() ) {
+			$results['endpoint'] = ! is_wp_error( $endpoint ) && 401 === (int) wp_remote_retrieve_response_code( $endpoint ) && false !== strpos( $challenge, 'resource_metadata' );
+		}
 		// When the site cannot call itself, the header cannot be checked: no verdict rather than a wrong one.
 		$header = Header_Check::run();
 		if ( 'unknown' !== $header ) {
@@ -757,15 +827,21 @@ class Admin_Page {
 			'header_fix_failed' => __( 'The change did not help, so .htaccess was put back as it was. Ask your host to pass the Authorization header to PHP, with the lines below.', 'site-agent-mcp-lite' ),
 			'header_not_writable' => __( 'WordPress cannot write .htaccess on this server. Add the lines below yourself, or ask your host.', 'site-agent-mcp-lite' ),
 			'header_removed'    => __( 'The Authorization block and its backup copy were removed from .htaccess.', 'site-agent-mcp-lite' ),
+			'header_remove_failed' => __( 'The Authorization block could not be removed: WordPress cannot write .htaccess on this server. Remove the lines between "# BEGIN Site Agent MCP" and "# END Site Agent MCP" yourself, or ask your host.', 'site-agent-mcp-lite' ),
+			'secret_removed'    => __( 'Changes saved. The saved value you chose to remove is deleted from this site.', 'site-agent-mcp-lite' ),
 			'autofilled'        => __( 'Your browser filled a field with your WordPress login or password. That value was not saved. Paste the key from the service instead.', 'site-agent-mcp-lite' ),
 			'revoked'           => __( 'Disconnected. The app no longer has access to this site.', 'site-agent-mcp-lite' ),
 			'client_invalid'    => __( 'The app was not registered: a name and at least one return address are required.', 'site-agent-mcp-lite' ),
 			'client_created'    => __( 'App registered.', 'site-agent-mcp-lite' ),
+			'client_created_partial' => __( 'App registered, but the return addresses below were not kept: only https addresses, or http for an app on your own computer, are accepted.', 'site-agent-mcp-lite' ),
+			'redirects_rejected' => __( 'Settings saved, but the return addresses below were not kept: only https addresses and app addresses, such as vscode://, are accepted.', 'site-agent-mcp-lite' ),
 			'client_deleted'    => __( 'App deleted. Connections made with it no longer work.', 'site-agent-mcp-lite' ),
 			'tested'            => __( 'Connection tests finished. Each service shows its result below.', 'site-agent-mcp-lite' ),
 			'checked'           => __( 'Checks finished. The results are below.', 'site-agent-mcp-lite' ),
 			'gsc_connected'     => __( 'Search Console connected.', 'site-agent-mcp-lite' ),
 			'gsc_disconnected'  => __( 'Search Console disconnected.', 'site-agent-mcp-lite' ),
+			/* translators: %s: address of the Google account permissions page */
+			'gsc_unrevoked'     => sprintf( __( 'Search Console is disconnected from this site, but Google did not confirm that it revoked the access. To be sure, remove the app from your Google account at %s.', 'site-agent-mcp-lite' ), 'https://myaccount.google.com/permissions' ),
 			'gsc_missing'       => __( 'Enter and save the client ID and secret first.', 'site-agent-mcp-lite' ),
 			'gsc_refused'       => __( 'Google did not grant access, so Search Console is not connected.', 'site-agent-mcp-lite' ),
 			'gsc_failed'        => __( 'Google did not return a lasting access. Check the client ID, secret and return address, then connect again.', 'site-agent-mcp-lite' ),
@@ -776,6 +852,33 @@ class Admin_Page {
 			'backup_deleted'    => __( 'Backup deleted.', 'site-agent-mcp-lite' ),
 			'backup_failed'     => __( 'The backup action did not complete.', 'site-agent-mcp-lite' ),
 		);
+	}
+
+	/**
+	 * Kind of each notice. Every notice that reports a failure or a partial result is
+	 * listed here; anything else is a success.
+	 *
+	 * @param string $notice Notice key.
+	 * @return string success, warning or error.
+	 */
+	private static function notice_type( $notice ) {
+		$types = array(
+			'client_invalid'         => 'error',
+			'gsc_missing'            => 'error',
+			'gsc_refused'            => 'error',
+			'gsc_failed'             => 'error',
+			'backup_failed'          => 'error',
+			'backup_job_failed'      => 'error',
+			'header_fix_failed'      => 'error',
+			'header_not_writable'    => 'error',
+			'header_remove_failed'   => 'error',
+			'autofilled'             => 'warning',
+			'gsc_unrevoked'          => 'warning',
+			'user_unknown'          => 'warning',
+			'client_created_partial' => 'warning',
+			'redirects_rejected'     => 'warning',
+		);
+		return isset( $types[ $notice ] ) ? $types[ $notice ] : 'success';
 	}
 
 	/**
@@ -792,22 +895,38 @@ class Admin_Page {
 		$detail   = get_transient( 'samcp_backup_detail_' . get_current_user_id() );
 		if ( false !== $detail ) {
 			delete_transient( 'samcp_backup_detail_' . get_current_user_id() );
-			if ( '' !== $text ) {
-				$text .= ' ' . $detail;
-			}
 		}
+		$detail   = is_string( $detail ) ? $detail : '';
+		$rejected = get_transient( 'samcp_rejected_' . get_current_user_id() );
+		if ( false !== $rejected ) {
+			delete_transient( 'samcp_rejected_' . get_current_user_id() );
+		}
+		$rejected = is_array( $rejected ) ? $rejected : array();
 		if ( '' === $text ) {
 			return;
 		}
-		$type = 'success';
-		if ( in_array( $notice, array( 'client_invalid', 'gsc_missing', 'gsc_refused', 'gsc_failed', 'backup_failed', 'backup_job_failed' ), true ) ) {
-			$type = 'error';
-		} elseif ( 'autofilled' === $notice ) {
-			$type = 'warning';
-		}
+		$type = self::notice_type( $notice );
+		// Engine errors stay in English, since agents read them too: mark them so, apart from the translated sentence.
+		$foreign = 0 !== strpos( determine_locale(), 'en' );
 		?>
 		<div id="samcp-notice" class="notice notice-<?php echo esc_attr( $type ); ?> inline samcp-notice<?php echo 'success' === $type ? ' is-dismissible' : ''; ?>" role="<?php echo 'success' === $type ? 'status' : 'alert'; ?>" tabindex="-1"<?php echo $focus ? ' data-samcp-focus' : ''; ?>>
-			<p><?php echo esc_html( $text ); ?></p>
+			<p>
+				<?php echo 'gsc_unrevoked' === $notice ? make_clickable( esc_html( $text ) ) : esc_html( $text ); // phpcs:ignore WordPress.Security.EscapeOutput -- escaped, then the bare URL turned into a link. ?>
+				<?php if ( '' !== $detail ) : ?>
+					<?php if ( $foreign ) : ?>
+						<span class="samcp-notice-detail"><?php esc_html_e( 'Technical detail, in English:', 'site-agent-mcp-lite' ); ?> <span lang="en" dir="ltr"><?php echo esc_html( $detail ); ?></span></span>
+					<?php else : ?>
+						<span class="samcp-notice-detail"><?php echo esc_html( $detail ); ?></span>
+					<?php endif; ?>
+				<?php endif; ?>
+			</p>
+			<?php if ( $rejected ) : ?>
+				<ul class="samcp-rejected">
+					<?php foreach ( $rejected as $line ) : ?>
+						<li><code dir="ltr"><?php echo esc_html( (string) $line ); ?></code></li>
+					<?php endforeach; ?>
+				</ul>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
@@ -951,7 +1070,7 @@ class Admin_Page {
 	/** Banner shown while agents are switched off, with the switch. */
 	private static function render_switched_off() {
 		?>
-		<div class="notice notice-warning inline samcp-switched-off">
+		<div class="notice notice-warning inline samcp-switched-off" id="samcp-switched-off">
 			<p><strong><?php esc_html_e( 'AI agents are switched off on this site.', 'site-agent-mcp-lite' ); ?></strong> <?php esc_html_e( 'No app can connect or act until an administrator switches them on.', 'site-agent-mcp-lite' ); ?></p>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 				<?php wp_nonce_field( 'samcp_switch' ); ?>
@@ -967,6 +1086,12 @@ class Admin_Page {
 		$settings = Policy::settings();
 		$levels   = array_keys( Policy::LEVELS );
 		$roles    = wp_roles()->roles;
+		$unknown  = get_transient( 'samcp_unknown_user_' . get_current_user_id() );
+		if ( false !== $unknown ) {
+			delete_transient( 'samcp_unknown_user_' . get_current_user_id() );
+		}
+		$unknown_level = is_array( $unknown ) && isset( $unknown['level'] ) && Policy::is_level( $unknown['level'] ) ? $unknown['level'] : 'none';
+		$unknown       = is_array( $unknown ) && isset( $unknown['who'] ) ? (string) $unknown['who'] : '';
 		?>
 		<section class="samcp-panel" aria-labelledby="samcp-access-title">
 			<h2 id="samcp-access-title"><?php esc_html_e( 'Access for AI agents', 'site-agent-mcp-lite' ); ?></h2>
@@ -1061,11 +1186,14 @@ class Admin_Page {
 					<tr>
 						<th scope="row"><label for="samcp-new-user"><?php esc_html_e( 'Add an account (login or email)', 'site-agent-mcp-lite' ); ?></label></th>
 						<td>
-							<input id="samcp-new-user" name="new_user" type="text" class="regular-text" autocomplete="off">
+							<input id="samcp-new-user" name="new_user" type="text" class="regular-text" autocomplete="off"<?php echo '' !== $unknown ? ' value="' . esc_attr( $unknown ) . '" aria-invalid="true" aria-describedby="samcp-new-user-error"' : ''; ?>>
+							<?php if ( '' !== $unknown ) : ?>
+								<p class="description samcp-field-error" id="samcp-new-user-error"><?php esc_html_e( 'No account of this site has this login or email. Check the spelling, then save again.', 'site-agent-mcp-lite' ); ?></p>
+							<?php endif; ?>
 							<label for="samcp-new-level" class="screen-reader-text"><?php esc_html_e( 'Level for this account', 'site-agent-mcp-lite' ); ?></label>
 							<select id="samcp-new-level" name="new_level">
 								<?php foreach ( $levels as $level ) : ?>
-									<option value="<?php echo esc_attr( $level ); ?>" <?php selected( $level, 'none' ); ?>><?php echo esc_html( Policy::level_label( $level ) ); ?></option>
+									<option value="<?php echo esc_attr( $level ); ?>" <?php selected( $level, $unknown_level ); ?>><?php echo esc_html( Policy::level_label( $level ) ); ?></option>
 								<?php endforeach; ?>
 							</select>
 						</td>
@@ -1085,28 +1213,30 @@ class Admin_Page {
 		if ( ! Policy::enabled() ) {
 			return;
 		}
-		$open    = Policy::pairing_open( get_current_user_id() );
-		$minutes = (int) ceil( Policy::pairing_left( get_current_user_id() ) / 60 );
+		$open  = Policy::pairing_open( get_current_user_id() );
+		$until = time() + Policy::pairing_left( get_current_user_id() );
+		// A closing time, not a countdown: it stays true however long the page stays open.
+		$attributes = $open ? ' data-samcp-pairing-until="' . esc_attr( (string) $until ) . '" data-samcp-pairing-now="' . esc_attr( (string) time() ) . '"' : '';
 		?>
-		<section class="samcp-panel samcp-pairing" aria-labelledby="samcp-pairing-title">
+		<section class="samcp-panel samcp-pairing" aria-labelledby="samcp-pairing-title"<?php echo $attributes; // phpcs:ignore WordPress.Security.EscapeOutput -- escaped above. ?>>
 			<div class="samcp-panel-head">
 				<h2 id="samcp-pairing-title"><?php esc_html_e( 'New connections', 'site-agent-mcp-lite' ); ?></h2>
 				<?php
 				if ( $open ) {
-					/* translators: %d: minutes. */
-					self::badge( 'success', sprintf( _n( 'Open for %d more minute', 'Open for %d more minutes', $minutes, 'site-agent-mcp-lite' ), $minutes ) );
+					/* translators: %s: time of day, such as 14:35. */
+					self::badge( 'success', sprintf( __( 'Open until %s', 'site-agent-mcp-lite' ), wp_date( (string) get_option( 'time_format', 'H:i' ), $until ) ) );
 				} else {
 					self::badge( 'neutral', __( 'Closed', 'site-agent-mcp-lite' ) );
 				}
 				?>
 			</div>
-			<p><?php echo $open ? esc_html__( 'Start the connection from your AI app now. New connections close by themselves.', 'site-agent-mcp-lite' ) : esc_html__( 'To connect an app, open new connections here, then start from the app within 15 minutes. A link received by email or chat can never connect an app on its own.', 'site-agent-mcp-lite' ); ?></p>
+			<p data-samcp-pairing-text><?php echo $open ? esc_html__( 'Start the connection from your AI app now. New connections close by themselves at that time, or once an app is approved.', 'site-agent-mcp-lite' ) : esc_html__( 'To connect an app, open new connections here, then start from the app within 15 minutes. A link received by email or chat can never connect an app on its own.', 'site-agent-mcp-lite' ); ?></p>
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 				<?php wp_nonce_field( 'samcp_pairing' ); ?>
 				<input type="hidden" name="action" value="samcp_pairing">
 				<?php if ( $open ) : ?>
-					<input type="hidden" name="pairing" value="close">
-					<p><button type="submit" class="button"><?php esc_html_e( 'Close now', 'site-agent-mcp-lite' ); ?></button></p>
+					<input type="hidden" name="pairing" value="close" data-samcp-pairing-field>
+					<p><button type="submit" class="button" data-samcp-pairing-button><?php esc_html_e( 'Close now', 'site-agent-mcp-lite' ); ?></button></p>
 				<?php else : ?>
 					<input type="hidden" name="pairing" value="open">
 					<p><button type="submit" class="button button-primary"><?php esc_html_e( 'Allow a new connection', 'site-agent-mcp-lite' ); ?></button></p>
@@ -1124,7 +1254,22 @@ class Admin_Page {
 			<hr class="wp-header-end">
 			<?php self::render_notice( true ); ?>
 			<div class="samcp-content">
-				<?php self::render_connect( false ); ?>
+				<?php
+				if ( Policy::enabled() ) {
+					self::render_connect( false );
+				} else {
+					// Only an administrator can switch agents on: say so, without instructions that cannot work.
+					?>
+					<div class="notice notice-warning inline samcp-switched-off" id="samcp-switched-off">
+						<p><strong><?php esc_html_e( 'AI connections are switched off on this site.', 'site-agent-mcp-lite' ); ?></strong> <?php esc_html_e( 'No app can connect until an administrator of this site switches them on. Ask them, then come back to this page to connect your app.', 'site-agent-mcp-lite' ); ?></p>
+					</div>
+					<section class="samcp-panel" aria-labelledby="samcp-connections-title">
+						<h2 id="samcp-connections-title"><?php esc_html_e( 'Your connections', 'site-agent-mcp-lite' ); ?></h2>
+						<?php self::render_connections( false ); ?>
+					</section>
+					<?php
+				}
+				?>
 			</div>
 			<?php self::render_dialog(); ?>
 		</div>
@@ -1135,16 +1280,13 @@ class Admin_Page {
 
 	/** Overview: status tiles, first steps, checks and latest activity. */
 	private static function render_overview() {
-		$connections = Store::connections( null );
-		$last_used   = 0;
-		$power       = 0;
-		foreach ( $connections as $row ) {
-			$last_used = max( $last_used, (int) $row['last_used_at'] );
-			if ( false !== strpos( (string) $row['scope'], OAuth::SCOPE_POWER ) ) {
-				++$power;
-			}
-		}
-		$backups       = Backup::all();
+		// Counted apart from the list, so the tile stays true past one page of connections.
+		$stats         = Store::connection_stats( null );
+		$last_used     = $stats['last_used'];
+		$power         = $stats['power'];
+		$enabled       = Policy::enabled();
+		$can_backup    = Backup::can_manage();
+		$backups       = $can_backup ? Backup::all() : array();
 		$latest        = $backups ? $backups[0] : null;
 		$last_complete = null;
 		foreach ( $backups as $backup ) {
@@ -1158,44 +1300,64 @@ class Admin_Page {
 		$checks   = is_array( $checks ) && isset( $checks['results'] ) ? $checks : null;
 		$passed   = $checks ? count( array_filter( $checks['results'] ) ) : 0;
 		$total    = $checks ? count( $checks['results'] ) : 0;
+		$deferred = $checks && ! empty( $checks['deferred'] ) ? array_values( array_filter( (array) $checks['deferred'], 'is_string' ) ) : array();
+		$all_ok   = $checks && $passed === $total && ! $deferred;
 		$services = '' !== Seo_Tools::api_key( Seo_Tools::GOOGLE_OPTION, 'SAMCP_GOOGLE_API_KEY' ) || '' !== Seo_Tools::api_key( Seo_Tools::GTMETRIX_OPTION, 'SAMCP_GTMETRIX_API_KEY' ) || Search_Console::is_connected();
 
 		// Connections.
-		$count = count( $connections );
+		$count = $stats['total'];
 		if ( $power ) {
 			/* translators: %d: number of connections. */
 			$conn = array( 'warning', sprintf( _n( '%d with server tools', '%d with server tools', $power, 'site-agent-mcp-lite' ), $power ) );
 		} else {
 			$conn = $count ? array( 'success', __( 'Connected', 'site-agent-mcp-lite' ) ) : array( 'neutral', __( 'Not connected', 'site-agent-mcp-lite' ) );
 		}
+		// Each tile gives one state (the badge) and one next step: an empty state has no value line repeating the badge.
 		$tiles = array(
 			array(
 				'icon'  => 'admin-links',
 				'label' => __( 'Connections', 'site-agent-mcp-lite' ),
 				/* translators: %d: number of connections. */
-				'value' => $count ? sprintf( _n( '%d active', '%d active', $count, 'site-agent-mcp-lite' ), $count ) : __( 'None yet', 'site-agent-mcp-lite' ),
+				'value' => $count ? sprintf( _n( '%d active', '%d active', $count, 'site-agent-mcp-lite' ), $count ) : '',
 				/* translators: %s: date. */
-				'meta'  => $last_used ? sprintf( __( 'Last used %s', 'site-agent-mcp-lite' ), wp_date( 'Y-m-d H:i', $last_used ) ) : __( 'Not used yet', 'site-agent-mcp-lite' ),
+				'meta'  => $last_used ? sprintf( __( 'Last used %s', 'site-agent-mcp-lite' ), wp_date( 'Y-m-d H:i', $last_used ) ) : ( $count ? __( 'Not used yet', 'site-agent-mcp-lite' ) : '' ),
 				'state' => $conn[0],
 				'badge' => $conn[1],
 				'url'   => self::url( 'connect' ),
 				'link'  => $count ? __( 'Manage connections', 'site-agent-mcp-lite' ) : __( 'Connect an app', 'site-agent-mcp-lite' ),
 			),
 		);
+		// Switched off, no app can connect: lead to the switch rather than to instructions that cannot work.
+		if ( ! $enabled && ! $count ) {
+			$tiles[0]['url']  = '#samcp-switched-off';
+			$tiles[0]['link'] = __( 'Switch on AI agents first', 'site-agent-mcp-lite' );
+		}
 
 		// Backups.
 		$backup_tile = array(
 			'icon'  => 'backup',
 			'label' => __( 'Last backup', 'site-agent-mcp-lite' ),
-			'value' => __( 'None yet', 'site-agent-mcp-lite' ),
+			'value' => '',
 			'meta'  => __( 'Create one before letting an agent change the site.', 'site-agent-mcp-lite' ),
 			'state' => 'neutral',
 			'badge' => __( 'No backup yet', 'site-agent-mcp-lite' ),
 			'url'   => self::url( 'backups' ),
 			'link'  => __( 'Create a backup', 'site-agent-mcp-lite' ),
 		);
-		if ( $latest && ! in_array( $latest['state'], array( 'complete', 'failed' ), true ) ) {
-			$backup_tile['value'] = __( 'Backing up', 'site-agent-mcp-lite' );
+		if ( ! $can_backup ) {
+			// On a network, backups hold every site: say who can make one, with no link to a tab this account cannot open.
+			$backup_tile['meta']  = __( 'A backup holds every site of the network, so only a network administrator can create one. Ask them before letting an agent change the site.', 'site-agent-mcp-lite' );
+			$backup_tile['badge'] = __( 'Network administrators only', 'site-agent-mcp-lite' );
+			$backup_tile['url']   = '';
+			$backup_tile['link']  = '';
+		} elseif ( null !== Backup::storage_problem() ) {
+			// An unusable folder is not the same as no backup: the backups may still be there.
+			$backup_tile['value'] = __( 'Folder unavailable', 'site-agent-mcp-lite' );
+			$backup_tile['meta']  = __( 'The backup folder cannot be used right now.', 'site-agent-mcp-lite' );
+			$backup_tile['state'] = 'error';
+			$backup_tile['badge'] = __( 'Check the folder', 'site-agent-mcp-lite' );
+			$backup_tile['link']  = __( 'Open backups', 'site-agent-mcp-lite' );
+		} elseif ( $latest && ! in_array( $latest['state'], array( 'complete', 'failed' ), true ) ) {
 			$backup_tile['meta']  = __( 'A backup is running.', 'site-agent-mcp-lite' );
 			$backup_tile['state'] = 'info';
 			$backup_tile['badge'] = __( 'In progress', 'site-agent-mcp-lite' );
@@ -1218,7 +1380,9 @@ class Admin_Page {
 		$tiles[] = $backup_tile;
 
 		// Security audit.
-		if ( null === $audit['last_audit'] ) {
+		if ( 'incomplete' === $audit['audit_state'] ) {
+			$audit_state = array( 'warning', __( 'Incomplete', 'site-agent-mcp-lite' ) );
+		} elseif ( null === $audit['last_audit'] ) {
 			$audit_state = array( 'neutral', __( 'Never run', 'site-agent-mcp-lite' ) );
 		} else {
 			$audit_state = $audit['audit_due'] ? array( 'warning', __( 'Due', 'site-agent-mcp-lite' ) ) : array( 'success', __( 'Up to date', 'site-agent-mcp-lite' ) );
@@ -1226,7 +1390,7 @@ class Admin_Page {
 		$tiles[] = array(
 			'icon'  => 'shield',
 			'label' => __( 'Security audit', 'site-agent-mcp-lite' ),
-			'value' => null === $audit['last_audit'] ? __( 'Never run', 'site-agent-mcp-lite' ) : $audit['last_audit'],
+			'value' => null === $audit['last_audit'] ? '' : $audit['last_audit'],
 			'meta'  => __( 'Your AI app runs it with its security_audit tool, which changes nothing.', 'site-agent-mcp-lite' ),
 			'state' => $audit_state[0],
 			'badge' => $audit_state[1],
@@ -1244,15 +1408,32 @@ class Admin_Page {
 				}
 			}
 		}
-		$tiles[] = array(
-			'icon'  => 'yes-alt',
-			'label' => __( 'Connection checks', 'site-agent-mcp-lite' ),
-			/* translators: 1: checks passed, 2: checks run. */
-			'value' => $checks ? sprintf( __( '%1$d of %2$d passed', 'site-agent-mcp-lite' ), $passed, $total ) : __( 'Not checked yet', 'site-agent-mcp-lite' ),
+		if ( ! $checks ) {
+			$check_state = array( 'neutral', __( 'Not checked yet', 'site-agent-mcp-lite' ) );
+		} elseif ( $passed !== $total ) {
+			$check_state = array( 'error', __( 'Problem', 'site-agent-mcp-lite' ) );
+		} elseif ( $deferred ) {
+			// Never "All passed" while a check still waits for its verdict.
+			$check_state = array( 'info', __( 'Waiting for activation', 'site-agent-mcp-lite' ) );
+		} else {
+			$check_state = array( 'success', __( 'All passed', 'site-agent-mcp-lite' ) );
+		}
+		if ( '' !== $first_problem ) {
+			$check_meta = $first_problem;
+		} elseif ( $deferred ) {
+			$check_meta = __( 'The MCP endpoint is checked once AI agents are switched on. Switch them on, then run the checks again.', 'site-agent-mcp-lite' );
+		} else {
 			/* translators: %s: date. */
-			'meta'  => '' !== $first_problem ? $first_problem : ( $checks ? sprintf( __( 'Checked %s', 'site-agent-mcp-lite' ), wp_date( 'Y-m-d H:i', (int) $checks['time'] ) ) : '' ),
-			'state'  => $checks ? ( $passed === $total ? 'success' : 'error' ) : 'neutral',
-			'badge'  => $checks ? ( $passed === $total ? __( 'All passed', 'site-agent-mcp-lite' ) : __( 'Problem', 'site-agent-mcp-lite' ) ) : __( 'Not checked yet', 'site-agent-mcp-lite' ),
+			$check_meta = $checks ? sprintf( __( 'Checked %s', 'site-agent-mcp-lite' ), wp_date( 'Y-m-d H:i', (int) $checks['time'] ) ) : '';
+		}
+		$tiles[] = array(
+			'icon'   => 'yes-alt',
+			'label'  => __( 'Connection checks', 'site-agent-mcp-lite' ),
+			/* translators: 1: checks passed, 2: checks run. */
+			'value'  => $checks ? sprintf( __( '%1$d of %2$d passed', 'site-agent-mcp-lite' ), $passed, $total ) : '',
+			'meta'   => $check_meta,
+			'state'  => $check_state[0],
+			'badge'  => $check_state[1],
 			'url'    => '',
 			'link'   => '',
 			'checks' => true,
@@ -1260,16 +1441,21 @@ class Admin_Page {
 
 		$steps = array(
 			array(
-				'done' => $checks && $passed === $total,
+				'done' => $all_ok,
 				'text' => __( 'Run the connection checks and fix any problem.', 'site-agent-mcp-lite' ),
 				'url'  => '#samcp-checks',
 				'link' => __( 'Go to the checks', 'site-agent-mcp-lite' ),
 			),
-			array(
+			$enabled ? array(
 				'done' => $count > 0,
 				'text' => __( 'Connect your first AI app.', 'site-agent-mcp-lite' ),
 				'url'  => self::url( 'connect' ),
 				'link' => __( 'Connect an app', 'site-agent-mcp-lite' ),
+			) : array(
+				'done' => false,
+				'text' => __( 'Switch on AI agents, then connect your first AI app. Until then no app can connect.', 'site-agent-mcp-lite' ),
+				'url'  => '#samcp-switched-off',
+				'link' => __( 'Switch on AI agents first', 'site-agent-mcp-lite' ),
 			),
 			array(
 				'done' => null !== $last_complete,
@@ -1278,13 +1464,21 @@ class Admin_Page {
 				'link' => __( 'Create a backup', 'site-agent-mcp-lite' ),
 			),
 			array(
-				'done' => $services,
-				'text' => __( 'Optional: connect SEO services. Agents work without them.', 'site-agent-mcp-lite' ),
-				'url'  => self::url( 'services' ),
-				'link' => __( 'Set up services', 'site-agent-mcp-lite' ),
+				'done'     => $services,
+				'text'     => __( 'Optional: connect SEO services. Agents work without them.', 'site-agent-mcp-lite' ),
+				'url'      => self::url( 'services' ),
+				'link'     => __( 'Set up services', 'site-agent-mcp-lite' ),
+				'optional' => true,
 			),
 		);
-		$open = ! ( $steps[0]['done'] && $steps[1]['done'] && $steps[2]['done'] );
+		if ( ! $can_backup ) {
+			// The backup tile already names who can make one: no step this account cannot take.
+			unset( $steps[2] );
+		}
+		$open = false;
+		foreach ( $steps as $step ) {
+			$open = $open || ( ! $step['done'] && empty( $step['optional'] ) );
+		}
 		?>
 		<h2 class="screen-reader-text"><?php esc_html_e( 'Status', 'site-agent-mcp-lite' ); ?></h2>
 		<ul class="samcp-tiles">
@@ -1294,7 +1488,9 @@ class Admin_Page {
 						<h3><span class="dashicons dashicons-<?php echo esc_attr( $tile['icon'] ); ?>" aria-hidden="true"></span><?php echo esc_html( $tile['label'] ); ?></h3>
 						<?php self::badge( $tile['state'], $tile['badge'] ); ?>
 					</div>
-					<p class="samcp-tile-value"><?php echo esc_html( $tile['value'] ); ?></p>
+					<?php if ( '' !== $tile['value'] ) : ?>
+						<p class="samcp-tile-value"><?php echo esc_html( $tile['value'] ); ?></p>
+					<?php endif; ?>
 					<?php if ( '' !== $tile['meta'] ) : ?>
 						<p class="samcp-tile-meta"><?php echo esc_html( $tile['meta'] ); ?></p>
 					<?php endif; ?>
@@ -1304,7 +1500,7 @@ class Admin_Page {
 					<?php if ( ! empty( $tile['checks'] ) ) : ?>
 						<div class="samcp-tile-checks" id="samcp-checks">
 							<?php if ( $checks ) : ?>
-								<details class="samcp-tile-details"<?php echo $passed === $total ? '' : ' open'; ?>>
+								<details class="samcp-tile-details"<?php echo $all_ok ? '' : ' open'; ?>>
 									<summary><?php esc_html_e( 'See the checks', 'site-agent-mcp-lite' ); ?></summary>
 									<ul class="samcp-status-list">
 										<?php foreach ( $checks['results'] as $id => $ok ) : ?>
@@ -1316,6 +1512,15 @@ class Admin_Page {
 													<?php if ( '' !== $text[1] ) : ?>
 														<span class="samcp-fix"><?php echo esc_html( $text[1] ); ?></span>
 													<?php endif; ?>
+												</span>
+											</li>
+										<?php endforeach; ?>
+										<?php foreach ( $deferred as $id ) : ?>
+											<li data-samcp-check="<?php echo esc_attr( $id ); ?>" data-samcp-ok="deferred">
+												<?php self::badge( 'neutral', __( 'After activation', 'site-agent-mcp-lite' ) ); ?>
+												<span class="samcp-status-text">
+													<strong><?php esc_html_e( 'The MCP endpoint is not checked while AI agents are switched off.', 'site-agent-mcp-lite' ); ?></strong>
+													<span class="samcp-fix"><?php esc_html_e( 'Switched off, it refuses every app on purpose. Switch AI agents on, then run the checks again.', 'site-agent-mcp-lite' ); ?></span>
 												</span>
 											</li>
 										<?php endforeach; ?>
@@ -1458,7 +1663,7 @@ class Admin_Page {
 			<?php
 			// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display only.
 			$notice = isset( $_GET['samcp_notice'] ) ? sanitize_key( wp_unslash( $_GET['samcp_notice'] ) ) : '';
-			$open   = in_array( $notice, array( 'client_invalid', 'client_created', 'client_deleted' ), true );
+			$open   = in_array( $notice, array( 'client_invalid', 'client_created', 'client_created_partial', 'client_deleted' ), true );
 			?>
 			<section class="samcp-section-advanced" aria-labelledby="samcp-manual-title">
 				<details class="samcp-advanced samcp-manual"<?php echo $open ? ' open' : ''; ?>>
@@ -1495,13 +1700,28 @@ class Admin_Page {
 	 * @param bool $is_admin Show every user's connections.
 	 */
 	private static function render_connections( $is_admin ) {
-		$rows = Store::connections( $is_admin ? null : get_current_user_id() );
+		$user_id = $is_admin ? null : get_current_user_id();
+		$stats   = Store::connection_stats( $user_id );
+		$total   = $stats['total'];
+		$pages   = max( 1, (int) ceil( $total / self::CONNECTIONS_PER_PAGE ) );
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- paging only.
+		$paged = isset( $_GET['paged'] ) ? absint( wp_unslash( $_GET['paged'] ) ) : 1;
+		$paged = min( max( 1, $paged ), $pages );
+		$rows  = $total ? Store::connections( $user_id, self::CONNECTIONS_PER_PAGE, ( $paged - 1 ) * self::CONNECTIONS_PER_PAGE ) : array();
 		if ( ! $rows ) {
-			echo '<p>' . esc_html__( 'No AI app connected yet. Follow the instructions above for your app; it shows up here once you approve it.', 'site-agent-mcp-lite' ) . '</p>';
+			echo '<p>' . ( Policy::enabled() ? esc_html__( 'No AI app connected yet. Follow the instructions above for your app; it shows up here once you approve it.', 'site-agent-mcp-lite' ) : esc_html__( 'No AI app connected yet.', 'site-agent-mcp-lite' ) ) . '</p>';
 			return;
 		}
+		$paging = array(
+			'tab'   => 'connect',
+			/* translators: Accessible name of the page links under the list of connections. */
+			'label' => __( 'Connection pages', 'site-agent-mcp-lite' ),
+			/* translators: %s: number of connections. */
+			'count' => sprintf( _n( '%s connection', '%s connections', $total, 'site-agent-mcp-lite' ), number_format_i18n( $total ) ),
+		);
+		self::render_pagination( $paged, $pages, $total, array(), $paging );
 		?>
-		<table class="widefat striped samcp-table">
+		<table class="widefat striped samcp-table" data-samcp-connections="<?php echo esc_attr( (string) $total ); ?>">
 			<caption class="screen-reader-text"><?php esc_html_e( 'Connected AI apps', 'site-agent-mcp-lite' ); ?></caption>
 			<thead><tr>
 				<th scope="col"><?php esc_html_e( 'App', 'site-agent-mcp-lite' ); ?></th>
@@ -1553,6 +1773,9 @@ class Admin_Page {
 							<?php wp_nonce_field( 'samcp_revoke' ); ?>
 							<input type="hidden" name="action" value="samcp_revoke">
 							<input type="hidden" name="family" value="<?php echo esc_attr( $row['family'] ); ?>">
+							<?php if ( $paged > 1 ) : ?>
+								<input type="hidden" name="paged" value="<?php echo esc_attr( (string) $paged ); ?>">
+							<?php endif; ?>
 							<?php self::confirm_fallback( 'samcp-confirm-' . $row['family'], __( 'Confirm', 'site-agent-mcp-lite' ) ); ?>
 							<button type="submit" class="button button-small samcp-button-danger" aria-label="<?php echo esc_attr( $name ); ?>"><?php esc_html_e( 'Disconnect', 'site-agent-mcp-lite' ); ?></button>
 						</form>
@@ -1562,6 +1785,9 @@ class Admin_Page {
 			</tbody>
 		</table>
 		<?php
+		if ( count( $rows ) > 10 ) {
+			self::render_pagination( $paged, $pages, $total, array(), $paging );
+		}
 	}
 
 	/** Render administrator-created clients. */
@@ -1622,11 +1848,19 @@ class Admin_Page {
 			<p class="description" id="<?php echo esc_attr( $id ); ?>-help">
 				<?php if ( $saved ) : ?>
 					<strong><?php esc_html_e( 'Saved.', 'site-agent-mcp-lite' ); ?></strong>
-					<?php esc_html_e( 'Leave the field blank to keep it. Type a new value to replace it, or a single dash (-) to remove it.', 'site-agent-mcp-lite' ); ?>
+					<?php esc_html_e( 'Leave the field blank to keep it, or type a new value to replace it.', 'site-agent-mcp-lite' ); ?>
 				<?php else : ?>
 					<?php esc_html_e( 'Not saved yet. Paste it from the service.', 'site-agent-mcp-lite' ); ?>
 				<?php endif; ?>
 			</p>
+			<?php if ( $saved ) : ?>
+				<?php /* An explicit choice, rather than a convention typed into a masked field. */ ?>
+				<p class="samcp-remove-secret">
+					<label for="<?php echo esc_attr( $id ); ?>-remove"><input id="<?php echo esc_attr( $id ); ?>-remove" name="<?php echo esc_attr( $id ); ?>_remove" type="checkbox" value="1">
+					<?php /* translators: %s: name of the saved value, such as "Google API key". */ ?>
+					<?php echo esc_html( sprintf( __( 'Remove the saved %s', 'site-agent-mcp-lite' ), $label ) ); ?></label>
+				</p>
+			<?php endif; ?>
 		</div>
 		<?php
 	}
@@ -1715,12 +1949,17 @@ class Admin_Page {
 		if ( $connected ) {
 			$gsc_state = self::service_state( true, $results['gsc'] );
 			$gsc_state = 'success' === $gsc_state[0] ? array( 'success', __( 'Connected', 'site-agent-mcp-lite' ) ) : $gsc_state;
+		} elseif ( Site_Kit::search_console_ready() ) {
+			$gsc_state = array( 'success', __( 'Connected through Site Kit', 'site-agent-mcp-lite' ) );
 		} elseif ( $credentials ) {
 			$gsc_state = array( 'info', __( 'Ready to connect', 'site-agent-mcp-lite' ) );
 		} else {
 			$gsc_state = array( 'neutral', __( 'Not set up', 'site-agent-mcp-lite' ) );
 		}
 		$google_state = self::service_state( $google, $results['pagespeed'] );
+		if ( ! $google && Site_Kit::pagespeed_ready() ) {
+			$google_state = array( 'success', __( 'Connected through Site Kit', 'site-agent-mcp-lite' ) );
+		}
 		$gtm_state    = self::service_state( $gtmetrix, $results['gtmetrix'] );
 		// Setup steps open only for a first-time setup: nothing configured anywhere yet.
 		$first_time = ! ( $credentials || $connected || $google || $gtmetrix );
@@ -1734,6 +1973,9 @@ class Admin_Page {
 					<?php self::badge( $gsc_state[0], $gsc_state[1] ); ?>
 				</div>
 				<p class="samcp-service-purpose"><?php esc_html_e( 'Real clicks, impressions and positions in Google, the only real ranking data. Most useful of the three.', 'site-agent-mcp-lite' ); ?></p>
+				<?php if ( ! $connected && Site_Kit::search_console_ready() ) : ?>
+					<p class="samcp-sitekit" id="samcp-gsc-sitekit"><?php esc_html_e( 'Site Kit by Google already connects this site to Search Console: agents read search data through it, nothing to set up here. Connect below only if you also want URL inspection and sitemap submission.', 'site-agent-mcp-lite' ); ?></p>
+				<?php endif; ?>
 				<?php self::render_tests( $results['gsc'] ); ?>
 				<details class="samcp-steps"<?php echo $first_time ? ' open' : ''; ?>>
 					<summary><?php esc_html_e( 'Setup steps (about 10 minutes)', 'site-agent-mcp-lite' ); ?></summary>
@@ -1768,7 +2010,7 @@ class Admin_Page {
 				<?php if ( $connected || $credentials ) : ?>
 					<div class="samcp-actions">
 						<?php if ( $connected ) : ?>
-							<form method="post" action="<?php echo esc_url( $post ); ?>"<?php echo self::confirm_attributes( __( 'Disconnect Search Console?', 'site-agent-mcp-lite' ), __( 'Agents lose your real search data until you connect again. The access is also revoked at Google.', 'site-agent-mcp-lite' ), __( 'Disconnect Search Console', 'site-agent-mcp-lite' ) ); // phpcs:ignore WordPress.Security.EscapeOutput ?>>
+							<form method="post" action="<?php echo esc_url( $post ); ?>"<?php echo self::confirm_attributes( __( 'Disconnect Search Console?', 'site-agent-mcp-lite' ), __( 'Agents lose your real search data until you connect again. Site Agent MCP also asks Google to revoke the access, and tells you if Google does not confirm it.', 'site-agent-mcp-lite' ), __( 'Disconnect Search Console', 'site-agent-mcp-lite' ) ); // phpcs:ignore WordPress.Security.EscapeOutput ?>>
 								<?php wp_nonce_field( 'samcp_gsc_disconnect' ); ?>
 								<input type="hidden" name="action" value="samcp_gsc_disconnect">
 								<?php self::confirm_fallback( 'samcp-confirm-gsc', __( 'Confirm', 'site-agent-mcp-lite' ) ); ?>
@@ -1792,6 +2034,9 @@ class Admin_Page {
 					<?php self::badge( $google_state[0], $google_state[1] ); ?>
 				</div>
 				<p class="samcp-service-purpose"><?php esc_html_e( 'Speed tests, and speed measured on real visitors. Tested URLs are sent to Google.', 'site-agent-mcp-lite' ); ?></p>
+				<?php if ( ! $google && Site_Kit::pagespeed_ready() ) : ?>
+					<p class="samcp-sitekit" id="samcp-pagespeed-sitekit"><?php esc_html_e( 'Site Kit by Google already runs PageSpeed Insights on this site: agents use it for speed tests. A Google API key is still needed for the Chrome UX Report.', 'site-agent-mcp-lite' ); ?></p>
+				<?php endif; ?>
 				<?php self::render_tests( $results['pagespeed'] ); ?>
 				<details class="samcp-steps"<?php echo $first_time ? ' open' : ''; ?>>
 					<summary><?php esc_html_e( 'Setup steps (about 5 minutes)', 'site-agent-mcp-lite' ); ?></summary>
@@ -1902,17 +2147,23 @@ class Admin_Page {
 	}
 
 	/**
-	 * Page links of the activity table, in the WordPress list-table markup.
+	 * Page links of a table, in the WordPress list-table markup. The activity table
+	 * by default.
 	 *
-	 * @param int   $paged Current page.
-	 * @param int   $pages Number of pages.
-	 * @param int   $total Number of rows.
-	 * @param array $args  Query arguments to keep, such as the filter.
+	 * @param int   $paged  Current page.
+	 * @param int   $pages  Number of pages.
+	 * @param int   $total  Number of rows.
+	 * @param array $args   Query arguments to keep, such as the filter.
+	 * @param array $paging Optional tab, label (name of the links) and count (number of rows, in words).
 	 */
-	private static function render_pagination( $paged, $pages, $total, array $args ) {
+	private static function render_pagination( $paged, $pages, $total, array $args, array $paging = array() ) {
 		if ( $pages < 2 ) {
 			return;
 		}
+		$tab = isset( $paging['tab'] ) ? $paging['tab'] : 'activity';
+		/* translators: %s: number of tool calls. */
+		$count = isset( $paging['count'] ) ? $paging['count'] : sprintf( _n( '%s call', '%s calls', $total, 'site-agent-mcp-lite' ), number_format_i18n( $total ) );
+		$label = isset( $paging['label'] ) ? $paging['label'] : __( 'Activity pages', 'site-agent-mcp-lite' );
 		$links = array(
 			'first-page' => array( 1, __( 'First page', 'site-agent-mcp-lite' ), '&laquo;', 1 === $paged ),
 			'prev-page'  => array( $paged - 1, __( 'Previous page', 'site-agent-mcp-lite' ), '&lsaquo;', 1 === $paged ),
@@ -1920,10 +2171,9 @@ class Admin_Page {
 			'last-page'  => array( $pages, __( 'Last page', 'site-agent-mcp-lite' ), '&raquo;', $pages === $paged ),
 		);
 		?>
-		<nav class="tablenav samcp-tablenav" aria-label="<?php esc_attr_e( 'Activity pages', 'site-agent-mcp-lite' ); ?>">
+		<nav class="tablenav samcp-tablenav" aria-label="<?php echo esc_attr( $label ); ?>">
 			<div class="tablenav-pages">
-				<?php /* translators: %s: number of tool calls. */ ?>
-				<span class="displaying-num"><?php echo esc_html( sprintf( _n( '%s call', '%s calls', $total, 'site-agent-mcp-lite' ), number_format_i18n( $total ) ) ); ?></span>
+				<span class="displaying-num"><?php echo esc_html( $count ); ?></span>
 				<span class="pagination-links">
 					<?php foreach ( $links as $class => $link ) : ?>
 						<?php if ( 'next-page' === $class ) : ?>
@@ -1933,7 +2183,7 @@ class Admin_Page {
 						<?php if ( $link[3] ) : ?>
 							<span class="tablenav-pages-navspan button disabled" aria-hidden="true"><?php echo $link[2]; // phpcs:ignore WordPress.Security.EscapeOutput -- fixed entity. ?></span>
 						<?php else : ?>
-							<a class="<?php echo esc_attr( $class ); ?> button" href="<?php echo esc_url( self::url( 'activity', $link[0] > 1 ? $args + array( 'paged' => $link[0] ) : $args ) ); ?>"><span class="screen-reader-text"><?php echo esc_html( $link[1] ); ?></span><span aria-hidden="true"><?php echo $link[2]; // phpcs:ignore WordPress.Security.EscapeOutput -- fixed entity. ?></span></a>
+							<a class="<?php echo esc_attr( $class ); ?> button" href="<?php echo esc_url( self::url( $tab, $link[0] > 1 ? $args + array( 'paged' => $link[0] ) : $args ) ); ?>"><span class="screen-reader-text"><?php echo esc_html( $link[1] ); ?></span><span aria-hidden="true"><?php echo $link[2]; // phpcs:ignore WordPress.Security.EscapeOutput -- fixed entity. ?></span></a>
 						<?php endif; ?>
 					<?php endforeach; ?>
 				</span>
@@ -2000,7 +2250,11 @@ class Admin_Page {
 		?>
 		<section class="samcp-panel samcp-full-info" id="samcp-full-info" aria-labelledby="samcp-full-info-title">
 			<h2 id="samcp-full-info-title"><?php esc_html_e( 'Site Agent MCP Full', 'site-agent-mcp-lite' ); ?></h2>
-			<p><?php esc_html_e( 'This is Site Agent MCP Lite, the edition published on wordpress.org. Site Agent MCP Full, distributed from its own site, also offers:', 'site-agent-mcp-lite' ); ?></p>
+			<p>
+				<?php esc_html_e( 'This is Site Agent MCP Lite. Its source code and releases are public on GitHub.', 'site-agent-mcp-lite' ); ?>
+				<?php echo self::external_link( self::LITE_SOURCE_URL, __( 'Site Agent MCP Lite on GitHub', 'site-agent-mcp-lite' ) ); // phpcs:ignore WordPress.Security.EscapeOutput ?>
+			</p>
+			<p><?php esc_html_e( 'Site Agent MCP Full, distributed from its own site, also offers:', 'site-agent-mcp-lite' ); ?></p>
 			<ul class="ul-disc">
 				<li><?php esc_html_e( 'Server-level tools for agents: site files, SQL, PHP and WP-CLI, offered on the consent screen and off unless you tick them.', 'site-agent-mcp-lite' ); ?></li>
 				<li><?php esc_html_e( 'Restoring a backup from the Backups tab.', 'site-agent-mcp-lite' ); ?></li>
@@ -2027,6 +2281,24 @@ class Admin_Page {
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 				<?php wp_nonce_field( 'samcp_settings' ); ?>
 				<input type="hidden" name="action" value="samcp_settings">
+				<?php if ( 'lite' === SAMCP_EDITION ) : ?>
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><?php esc_html_e( 'New versions', 'site-agent-mcp-lite' ); ?></th>
+						<td>
+							<fieldset>
+								<legend class="screen-reader-text"><?php esc_html_e( 'New versions', 'site-agent-mcp-lite' ); ?></legend>
+								<label for="samcp-release-notice"><input id="samcp-release-notice" type="checkbox" name="release_notice" value="1" aria-describedby="samcp-release-notice-help" <?php checked( Release_Notice::enabled() ); ?><?php disabled( ! Release_Notice::can_manage() ); ?>>
+								<?php esc_html_e( 'Tell me when a new version of Site Agent MCP Lite is published', 'site-agent-mcp-lite' ); ?></label>
+								<p class="description" id="samcp-release-notice-help"><?php esc_html_e( 'Twice a day at most, the site asks GitHub for the latest version of the plugin. Nothing is downloaded or installed: a notice links to the new version.', 'site-agent-mcp-lite' ); ?></p>
+								<?php if ( ! Release_Notice::can_manage() ) : ?>
+								<p class="description"><?php esc_html_e( 'Only a network administrator can change this setting.', 'site-agent-mcp-lite' ); ?></p>
+								<?php endif; ?>
+							</fieldset>
+						</td>
+					</tr>
+				</table>
+				<?php endif; ?>
 				<?php if ( Header_Check::has_block() ) : ?>
 					<p class="description" id="samcp-header-block"><?php esc_html_e( 'Site Agent MCP added a block at the top of .htaccess so the Authorization header reaches WordPress.', 'site-agent-mcp-lite' ); ?></p>
 				<?php endif; ?>
@@ -2071,7 +2343,8 @@ class Admin_Page {
 				);
 				?>
 				<?php echo self::external_link( 'https://www.linkedin.com/in/laurentrochetta/', 'LinkedIn' ); // phpcs:ignore WordPress.Security.EscapeOutput ?> ·
-				<?php echo self::external_link( 'https://github.com/lrochetta', 'GitHub' ); // phpcs:ignore WordPress.Security.EscapeOutput ?>
+				<?php echo self::external_link( 'https://github.com/lrochetta', 'GitHub' ); // phpcs:ignore WordPress.Security.EscapeOutput ?> ·
+				<?php echo self::external_link( 'https://www.patreon.com/c/yeswebuild', 'Patreon' ); // phpcs:ignore WordPress.Security.EscapeOutput ?>
 			</p>
 		</section>
 		<?php
