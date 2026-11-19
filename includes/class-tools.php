@@ -296,6 +296,8 @@ class Tools {
 			if ( ! self::allowed( $name, $tool, $token ) ) {
 				throw new Tool_Error( esc_html( self::denial( $name, $tool, $token ) ) );
 			}
+			// Every handler gets arguments of the shape its schema announces, whatever the client sent.
+			self::validate_arguments( $tool['inputSchema'], $arguments );
 			$output = call_user_func( $tool['handler'], $arguments, $token );
 		} catch ( Tool_Error $e ) {
 			$failed = true;
@@ -354,6 +356,143 @@ class Tools {
 			return 'This connection works on content only. Ask the user to reconnect with more access if the task needs it.';
 		}
 		return 'Your WordPress account does not have the right to use this tool (' . $tool['capability'] . ').';
+	}
+
+	/**
+	 * Check arguments against a tool's input schema before its handler runs: required
+	 * properties, types, enum values and the items of arrays, nested objects included.
+	 * Properties the schema does not list are left to the handler, as JSON Schema allows
+	 * them. A null optional argument counts as omitted, since many clients send one.
+	 *
+	 * @param array $schema    Input schema.
+	 * @param array $arguments Arguments.
+	 * @throws Tool_Error Naming every mismatch, five at most.
+	 */
+	public static function validate_arguments( array $schema, array $arguments ) {
+		$problems = self::schema_problems( $schema, $arguments, '' );
+		if ( $problems ) {
+			$more = count( $problems ) > 5 ? ' (and ' . ( count( $problems ) - 5 ) . ' more)' : '';
+			// Plain words only (no quotes or brackets of HTML), so escaping changes nothing an agent reads.
+			throw new Tool_Error( esc_html( 'Invalid arguments, nothing was done: ' . implode( '; ', array_slice( $problems, 0, 5 ) ) . $more . '. The expected arguments are in the inputSchema of this tool (tools/list).' ) );
+		}
+	}
+
+	/**
+	 * Mismatches between a value and a schema.
+	 *
+	 * @param array  $schema Schema.
+	 * @param mixed  $value  Value.
+	 * @param string $path   Where the value sits, empty for the arguments themselves.
+	 * @return string[]
+	 */
+	private static function schema_problems( array $schema, $value, $path ) {
+		$label = '' === $path ? 'the arguments' : $path;
+		if ( isset( $schema['type'] ) && ! self::has_type( $value, $schema['type'] ) ) {
+			return array( $label . ' must be ' . implode( ' or ', (array) $schema['type'] ) . ', not ' . self::type_of( $value ) );
+		}
+		if ( isset( $schema['enum'] ) && is_array( $schema['enum'] ) && ! in_array( $value, $schema['enum'], true ) ) {
+			return array( $label . ' must be one of ' . implode( ', ', array_map( 'strval', $schema['enum'] ) ) );
+		}
+		if ( ! is_array( $value ) ) {
+			return array();
+		}
+		$problems = array();
+		if ( isset( $schema['items'] ) && is_array( $schema['items'] ) && self::is_list( $value ) ) {
+			foreach ( $value as $index => $item ) {
+				$problems = array_merge( $problems, self::schema_problems( $schema['items'], $item, $label . '[' . $index . ']' ) );
+			}
+		}
+		if ( ( $value && self::is_list( $value ) ) || ! ( isset( $schema['properties'] ) || isset( $schema['required'] ) ) ) {
+			return $problems;
+		}
+		$prefix = '' === $path ? '' : $path . '.';
+		foreach ( isset( $schema['required'] ) ? (array) $schema['required'] : array() as $name ) {
+			if ( ! isset( $value[ $name ] ) ) {
+				$problems[] = $prefix . $name . ' is required';
+			}
+		}
+		$properties = isset( $schema['properties'] ) && is_array( $schema['properties'] ) ? $schema['properties'] : array();
+		foreach ( $properties as $name => $property ) {
+			if ( isset( $value[ $name ] ) && is_array( $property ) ) {
+				$problems = array_merge( $problems, self::schema_problems( $property, $value[ $name ], $prefix . $name ) );
+			}
+		}
+		return $problems;
+	}
+
+	/**
+	 * Whether a decoded JSON value has one of the JSON Schema types. JSON objects and arrays
+	 * both decode to PHP arrays: an object has keys, an array has none or 0, 1, 2...
+	 *
+	 * @param mixed           $value Value.
+	 * @param string|string[] $types Type or types.
+	 * @return bool
+	 */
+	private static function has_type( $value, $types ) {
+		foreach ( (array) $types as $type ) {
+			switch ( $type ) {
+				case 'string':
+					$ok = is_string( $value );
+					break;
+				case 'integer':
+					// 5.0 is an integer in JSON Schema; 5.5 and "5" are not.
+					$ok = is_int( $value ) || ( is_float( $value ) && is_finite( $value ) && floor( $value ) === $value );
+					break;
+				case 'number':
+					$ok = is_int( $value ) || is_float( $value );
+					break;
+				case 'boolean':
+					$ok = is_bool( $value );
+					break;
+				case 'object':
+					$ok = is_array( $value ) && ( ! $value || ! self::is_list( $value ) );
+					break;
+				case 'array':
+					$ok = is_array( $value ) && self::is_list( $value );
+					break;
+				case 'null':
+					$ok = null === $value;
+					break;
+				default:
+					$ok = true;
+			}
+			if ( $ok ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * JSON Schema type name of a decoded value, for error messages.
+	 *
+	 * @param mixed $value Value.
+	 * @return string
+	 */
+	private static function type_of( $value ) {
+		if ( is_array( $value ) ) {
+			return $value && ! self::is_list( $value ) ? 'object' : 'array';
+		}
+		if ( is_bool( $value ) ) {
+			return 'boolean';
+		}
+		if ( is_int( $value ) ) {
+			return 'integer';
+		}
+		if ( is_float( $value ) ) {
+			return 'number';
+		}
+		return null === $value ? 'null' : 'string';
+	}
+
+	/**
+	 * Whether an array has the keys 0, 1, 2... in order (PHP 7.4 has no array_is_list).
+	 *
+	 * @param array $value Array.
+	 * @return bool
+	 */
+	private static function is_list( array $value ) {
+		return ! $value || array_keys( $value ) === range( 0, count( $value ) - 1 );
 	}
 
 	/**

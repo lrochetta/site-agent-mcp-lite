@@ -4,7 +4,7 @@ Donate link: https://www.patreon.com/c/yeswebuild
 Tags: mcp, ai, agents, oauth, seo
 Requires at least: 6.9
 Tested up to: 7.1
-Stable tag: 0.9.0
+Stable tag: 0.9.1
 Requires PHP: 7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -113,7 +113,7 @@ Site Agent MCP Full, distributed from https://mcp.wordpress-custom.com/ , adds t
 
 = Does the plugin work on multisite? =
 
-Multisite networks are not supported yet. Each site of a network keeps its own connections, settings and data. Deactivating the plugin for the whole network ends the connections of every site, but deleting it removes the data of the main site only. On a network, only super admins can change options directly or create backups through the plugin.
+Multisite networks are not supported yet. Each site of a network keeps its own connections, settings and data. Deactivating the plugin for the whole network ends the connections of every site, and deleting it removes its data from every site of the network. On a network, only super admins can change options directly or create backups through the plugin.
 
 == Screenshots ==
 
@@ -125,6 +125,12 @@ Multisite networks are not supported yet. Each site of a network keeps its own c
 6. Site Agent > Activity: every tool call, by user and application.
 
 == Changelog ==
+
+= 0.9.1 =
+* On a multisite network, deleting the plugin now removes its tables, settings and scheduled tasks from every site, not only the main one. Multisite is still not supported otherwise.
+* Every tool checks the arguments an AI app sends before doing anything: a missing value, a wrong type or a value outside the allowed list is refused with a message that says what to send instead.
+* The Search Console and PageSpeed connection through Site Kit by Google is now tested on this edition too.
+* Tested with the keyboard only: switching agents on, approving a connection and disconnecting it, with the focus order, the confirmation dialog and the names screen readers announce.
 
 = 0.9.0 =
 * About 80 fixes from an independent audit of 0.8.1, covered by new checks in the test bench.

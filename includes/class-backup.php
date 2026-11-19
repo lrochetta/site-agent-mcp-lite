@@ -457,6 +457,48 @@ class Backup {
 		if ( ! $fresh && is_array( $saved ) && isset( $saved['dir'], $saved['state'] ) && $saved['dir'] === $dir ) {
 			return (string) $saved['state'];
 		}
+		$state = self::probe( $dir, $url );
+		set_transient(
+			self::EXPOSURE,
+			array(
+				'dir'   => $dir,
+				'state' => $state,
+			),
+			'blocked' === $state ? 6 * HOUR_IN_SECONDS : 10 * MINUTE_IN_SECONDS
+		);
+		return $state;
+	}
+
+	/**
+	 * Give another folder of this plugin the backups' protection: the same deny files, then
+	 * a fresh witness probe over HTTP. Used for the site import's working folders, which
+	 * hold a whole wp-content, plugin code included. Nothing is cached.
+	 *
+	 * @param string $dir Folder, created if missing.
+	 * @return string 'outside', 'blocked', 'served' or 'unknown', as exposure() says; 'unwritable'
+	 *                when the folder or its deny files cannot be written.
+	 */
+	public static function shield( $dir ) {
+		$dir = untrailingslashit( wp_normalize_path( $dir ) );
+		if ( ! ( is_dir( $dir ) || wp_mkdir_p( $dir ) ) || ! wp_is_writable( $dir ) ) {
+			return 'unwritable';
+		}
+		self::protect( $dir );
+		if ( ! is_file( $dir . '/.htaccess' ) || ! is_file( $dir . '/web.config' ) ) {
+			return 'unwritable';
+		}
+		$url = self::witness_url( $dir );
+		return null === $url ? 'outside' : self::probe( $dir, $url );
+	}
+
+	/**
+	 * Fetch a new witness file of a folder over HTTP.
+	 *
+	 * @param string $dir Folder.
+	 * @param string $url Address of its witness file.
+	 * @return string 'blocked', 'served' or 'unknown'.
+	 */
+	private static function probe( $dir, $url ) {
 		// New content on every probe, so a cached copy of an older witness proves nothing.
 		$marker = 'samcp-witness-' . bin2hex( random_bytes( 16 ) );
 		$state  = 'unknown';
@@ -479,14 +521,6 @@ class Backup {
 				}
 			}
 		}
-		set_transient(
-			self::EXPOSURE,
-			array(
-				'dir'   => $dir,
-				'state' => $state,
-			),
-			'blocked' === $state ? 6 * HOUR_IN_SECONDS : 10 * MINUTE_IN_SECONDS
-		);
 		return $state;
 	}
 
